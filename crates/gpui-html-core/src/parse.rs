@@ -2,17 +2,20 @@
 //!
 //! gpuiHTML is a strict subset of HTML5: tags must be balanced, attribute
 //! values must be double-quoted, and only the elements/attributes listed in
-//! the spec (see repo README) are recognised. Unknown tags become an
-//! [`Error::UnknownTag`] rather than being passed through verbatim — the
-//! point of the spec is that everything maps to a known gpui call.
+//! the spec are recognised. Unknown tags become [`Error::UnknownTag`] rather
+//! than being passed through verbatim — the point of the spec is that
+//! everything maps to a known gpui call.
 
 use crate::ast::Node;
+use crate::{Error, ParseError, ParseErrorKind};
 
-#[derive(Debug)]
-pub enum Error {
-    Unimplemented,
-}
-
-pub fn parse(_src: &str) -> Result<Vec<Node>, Error> {
-    Err(Error::Unimplemented)
+/// Implemented in a follow-up commit (issue #1). Stub returns `UnexpectedEof`
+/// for the empty-input case so downstream code can already pattern-match
+/// against the structured error type.
+pub fn parse(src: &str) -> Result<Vec<Node>, Error> {
+    Err(Error::Parse(ParseError {
+        kind: ParseErrorKind::UnexpectedEof,
+        span: crate::ast::Span::new(0, src.len()),
+        message: "parser not yet implemented".into(),
+    }))
 }

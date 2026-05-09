@@ -16,25 +16,157 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod diagnostic;
 pub mod parse;
 
+use ast::Span;
+
 /// Convenience: gpuiHTML source -> emitted gpui Rust source.
-///
-/// Equivalent to `codegen::emit(&parse::parse(src)?)`.
-pub fn compile(_src: &str) -> Result<String, Error> {
-    Err(Error::Unimplemented)
+pub fn compile(src: &str) -> Result<String, Error> {
+    let nodes = parse::parse(src)?;
+    codegen::emit(&nodes)
 }
 
-#[derive(Debug)]
+/// Structured compiler error. Every variant carries the source [`Span`] of
+/// the offending token so diagnostics can render line/column and a caret —
+/// see [`diagnostic::Diagnostic`] for the wire schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    Unimplemented,
+    Parse(ParseError),
+    UnknownTag {
+        tag: String,
+        span: Span,
+    },
+    UnknownClass {
+        class: String,
+        span: Span,
+        hint: Option<String>,
+    },
+    UnsupportedAttribute {
+        attr: String,
+        span: Span,
+    },
+    UnknownThemeToken {
+        token: String,
+        span: Span,
+    },
+    InvalidEventHandler {
+        name: String,
+        span: Span,
+    },
+    InvalidInterpolation {
+        raw: String,
+        span: Span,
+    },
+    Codegen(CodegenError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub span: Span,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    UnbalancedTag { expected: String, found: String },
+    UnclosedTag,
+    UnclosedAttribute,
+    InvalidCharacter(char),
+    UnexpectedEof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodegenError {
+    pub span: Span,
+    pub message: String,
+}
+
+impl Error {
+    pub fn span(&self) -> Span {
+        match self {
+            Error::Parse(e) => e.span,
+            Error::UnknownTag { span, .. } => *span,
+            Error::UnknownClass { span, .. } => *span,
+            Error::UnsupportedAttribute { span, .. } => *span,
+            Error::UnknownThemeToken { span, .. } => *span,
+            Error::InvalidEventHandler { span, .. } => *span,
+            Error::InvalidInterpolation { span, .. } => *span,
+            Error::Codegen(e) => e.span,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::Parse(_) => "Parse",
+            Error::UnknownTag { .. } => "UnknownTag",
+            Error::UnknownClass { .. } => "UnknownClass",
+            Error::UnsupportedAttribute { .. } => "UnsupportedAttribute",
+            Error::UnknownThemeToken { .. } => "UnknownThemeToken",
+            Error::InvalidEventHandler { .. } => "InvalidEventHandler",
+            Error::InvalidInterpolation { .. } => "InvalidInterpolation",
+            Error::Codegen(_) => "Codegen",
+        }
+    }
+
+    pub fn literal(&self) -> &str {
+        match self {
+            Error::Parse(e) => &e.message,
+            Error::UnknownTag { tag, .. } => tag,
+            Error::UnknownClass { class, .. } => class,
+            Error::UnsupportedAttribute { attr, .. } => attr,
+            Error::UnknownThemeToken { token, .. } => token,
+            Error::InvalidEventHandler { name, .. } => name,
+            Error::InvalidInterpolation { raw, .. } => raw,
+            Error::Codegen(e) => &e.message,
+        }
+    }
+
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            Error::UnknownClass { hint, .. } => hint.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Error::Parse(e) => e.message.clone(),
+            Error::UnknownTag { tag, .. } => format!("unknown tag `<{tag}>`"),
+            Error::UnknownClass { class, .. } => format!("unknown class `{class}`"),
+            Error::UnsupportedAttribute { attr, .. } => {
+                format!("unsupported attribute `{attr}`")
+            }
+            Error::UnknownThemeToken { token, .. } => {
+                format!("unknown theme token `{token}`")
+            }
+            Error::InvalidEventHandler { name, .. } => {
+                format!("invalid event handler `{name}`")
+            }
+            Error::InvalidInterpolation { raw, .. } => {
+                format!("invalid interpolation `{raw}`")
+            }
+            Error::Codegen(e) => e.message.clone(),
+        }
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(e: ParseError) -> Self {
+        Error::Parse(e)
+    }
+}
+
+impl From<CodegenError> for Error {
+    fn from(e: CodegenError) -> Self {
+        Error::Codegen(e)
+    }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unimplemented => write!(f, "not yet implemented"),
-        }
+        write!(f, "{}", self.message())
     }
 }
 

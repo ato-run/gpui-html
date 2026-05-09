@@ -9,7 +9,12 @@
 //! and is the source of truth for "what gpuiHTML supports".
 
 use crate::ast::Node;
+use crate::{CodegenError, Error};
 
-pub fn emit(_nodes: &[Node]) -> String {
-    String::new()
+/// Implemented in a follow-up commit (issue #4).
+pub fn emit(_nodes: &[Node]) -> Result<String, Error> {
+    Err(Error::Codegen(CodegenError {
+        span: crate::ast::Span::new(0, 0),
+        message: "codegen not yet implemented".into(),
+    }))
 }
