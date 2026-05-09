@@ -1,0 +1,17 @@
+[package]
+name = "gpui-html"
+description = "CLI that converts gpuiHTML files into gpui Rust code via the gpui-rsx IR."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "gpui-html"
+path = "src/main.rs"
+
+[dependencies]
+gpui-rsx.workspace = true

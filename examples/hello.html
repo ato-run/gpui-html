@@ -1,0 +1,21 @@
+<!--
+  gpuiHTML example: a minimal "hello world" panel.
+
+  Expected codegen (target output of `gpui-html examples/hello.html`):
+
+      div()
+          .flex()
+          .flex_col()
+          .gap_2()
+          .p_4()
+          .child("Hello, gpui!")
+          .child(
+              div()
+                  .text_color(rgb(0xffffff))
+                  .child("Compiled from HTML."),
+          )
+-->
+<div class="flex flex-col gap-2 p-4">
+  <span>Hello, gpui!</span>
+  <div class="text-white">Compiled from HTML.</div>
+</div>

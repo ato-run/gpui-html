@@ -1,0 +1,13 @@
+[package]
+name = "gpui-rsx"
+description = "Parser, IR, and code generator for the gpuiHTML spec — emits gpui builder code from HTML."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
