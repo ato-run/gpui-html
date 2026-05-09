@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/gpui-rsx",
+    "crates/gpui-html-core",
     "crates/gpui-html",
 ]
 
@@ -15,4 +15,4 @@ homepage = "https://github.com/ato-run/gpui-html"
 authors = ["ato-run"]
 
 [workspace.dependencies]
-gpui-rsx = { path = "crates/gpui-rsx", version = "0.0.0" }
+gpui-html-core = { path = "crates/gpui-html-core", version = "0.0.0" }

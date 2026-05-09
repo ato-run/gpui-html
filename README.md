@@ -14,10 +14,12 @@ compiles down to that builder code via a small intermediate representation.
 
 Not a browser, not a DOM — gpuiHTML is "HTML for gpui," and only what
 maps statically to `Styled` / `Style` is allowed. See **[docs/spec.md](docs/spec.md)**
-for the v0.1 spec (tag table, class table, theme tokens, codegen rules).
+for the v0.1 surface draft (tag table, class table, theme tokens,
+diagnostics, codegen rules).
 
-Status: **0.0.0 / scaffold.** Spec is locked at v0.1; parser and codegen
-are stubs. See [Roadmap](#roadmap).
+Status: **0.0.0 / scaffold.** The v0.1 surface is drafted and
+intentionally constrained; parser and codegen are stubs. See
+[Roadmap](#roadmap).
 
 ## Why three layers, not one
 
@@ -80,10 +82,13 @@ Three rules to keep in mind:
 
 ## Crates
 
-- [`gpui-rsx`](crates/gpui-rsx) — parser + IR + codegen library.
-  *(Note: name collides with [wsafight/gpui-rsx](https://crates.io/crates/gpui-rsx)
-  on crates.io; will be renamed before any publish — see spec 付録 B.)*
+- [`gpui-html-core`](crates/gpui-html-core) — parser + IR + codegen library.
 - [`gpui-html`](crates/gpui-html) — `gpui-html <input.html>` CLI.
+
+Prior art: wsafight's [`gpui-rsx`](https://crates.io/crates/gpui-rsx) is a
+proc-macro that compiles JSX-like syntax inline in Rust files. gpui-html
+targets the same lowering but for external `.gpui.html` design files
+authored by humans or LLMs — a different ergonomic, not a competitor.
 
 ## Roadmap
 

@@ -6,9 +6,9 @@ version = 3
 name = "gpui-html"
 version = "0.0.0"
 dependencies = [
- "gpui-rsx",
+ "gpui-html-core",
 ]
 
 [[package]]
-name = "gpui-rsx"
+name = "gpui-html-core"
 version = "0.0.0"

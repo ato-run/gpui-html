@@ -1,5 +1,5 @@
 [package]
-name = "gpui-rsx"
+name = "gpui-html-core"
 description = "Parser, IR, and code generator for the gpuiHTML spec — emits gpui builder code from HTML."
 version.workspace = true
 edition.workspace = true

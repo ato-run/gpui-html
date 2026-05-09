@@ -14,4 +14,4 @@ name = "gpui-html"
 path = "src/main.rs"
 
 [dependencies]
-gpui-rsx.workspace = true
+gpui-html-core.workspace = true
