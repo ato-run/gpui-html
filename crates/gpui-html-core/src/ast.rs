@@ -64,14 +64,20 @@ pub struct TextNode {
 }
 
 /// Captured `<style>` content. The `css` field holds the raw CSS source
-/// between the open and close tags (verbatim, no entity decoding). The
-/// `span` covers the entire `<style>...</style>` block so diagnostics
-/// can point at the exact source location of an offending rule once
-/// #27 lands the CSS lowering.
+/// between the open and close tags (verbatim, no entity decoding).
+///
+/// Two source offsets are tracked. `span` covers the entire
+/// `<style>...</style>` block — useful for diagnostics that want to
+/// point at the whole stylesheet. `content_start` is the byte offset
+/// in the original document where the CSS body begins (just after the
+/// open tag's `>`). The CSS parser uses `content_start` as the base
+/// to translate its internal offsets into absolute spans, so a CSS
+/// diagnostic points at the exact byte in the user's HTML source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleNode {
     pub css: String,
     pub span: Span,
+    pub content_start: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -613,11 +613,15 @@ impl<'src> Parser<'src> {
         self.advance();
         let (_name, _span) = self.parse_identifier("expected <style> tag name")?;
         self.consume_attrs_until_close()?;
+        // `consume_attrs_until_close` consumes past the `>`, so the
+        // current position is the first byte of CSS content.
+        let content_start = self.pos;
         let (css, end_pos) =
             self.consume_raw_text_until_close(RAW_TEXT_PRESERVE_TAG, open_start)?;
         Ok(StyleNode {
             css,
             span: Span::new(open_start, end_pos),
+            content_start,
         })
     }
 
