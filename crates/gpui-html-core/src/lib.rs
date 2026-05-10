@@ -15,6 +15,7 @@
 //! LSP server can reuse stage 1 without touching codegen.
 
 pub mod ast;
+pub mod class_map;
 pub mod codegen;
 pub mod diagnostic;
 pub mod parse;
