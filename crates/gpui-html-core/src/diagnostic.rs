@@ -57,6 +57,7 @@ pub fn line_column(src: &str, byte_offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Span;
 
     #[test]
     fn line_column_basics() {

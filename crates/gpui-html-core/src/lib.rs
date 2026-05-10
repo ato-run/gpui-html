@@ -19,7 +19,7 @@ pub mod codegen;
 pub mod diagnostic;
 pub mod parse;
 
-use ast::Span;
+pub use ast::Span;
 
 /// Convenience: gpuiHTML source -> emitted gpui Rust source.
 pub fn compile(src: &str) -> Result<String, Error> {
