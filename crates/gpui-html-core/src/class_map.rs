@@ -87,9 +87,26 @@
 //!   color, *not* a recursive width. The matcher tries width-shaped values
 //!   first, then falls back to theme-token shape.
 //!
-//! Color (symbolic theme tokens):
+//! Overflow / Cursor / Opacity:
+//!   overflow-{hidden,visible,scroll}        -> .overflow_<v>()
+//!   overflow-{x,y}-{hidden,scroll}          -> .overflow_<axis>_<v>()
+//!   cursor-{default,pointer,text,move,grab,grabbing,not-allowed,
+//!           col-resize,row-resize,ew-resize,ns-resize,nesw-resize,
+//!           nwse-resize,crosshair,help,none}
+//!                                            -> .cursor_<v>()
+//!   opacity-N (N ∈ 0..=100)                 -> .opacity(N.0 / 100.0)
+//!
+//!   Rejected with hint: `overflow-{auto,x-auto,y-auto}` — gpui's
+//!   Overflow enum has no `Auto` value (spec line 348).
+//!
+//! Color literals and theme tokens:
+//!   bg-transparent  -> .bg(gpui::transparent_black())   (literal, NOT theme.transparent)
 //!   bg-<token>      -> .bg(theme.<token>)
 //!   text-<token>    -> .text_color(theme.<token>)
+//!
+//!   Theme-token alpha (`bg-<token>/<n>`) is **deferred** — see #23 for
+//!   the design discussion. Rejected with a hint that points at the
+//!   issue, not silently treated as a normal theme token.
 //! ```
 //!
 //! Anything else surfaces as [`Error::UnknownClass`] with the offending
@@ -205,9 +222,71 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         return Ok(call);
     }
 
-    if let Some(token) = raw.strip_prefix("bg-") {
-        if is_theme_token(token) {
-            return Ok(MethodCall::unary("bg", format!("theme.{token}")));
+    // Spec lines 348-352: gpui has no Overflow::Auto. Reject before
+    // lower_overflow runs so the diagnostic explains the gpui-side
+    // reason, not a generic UnknownClass.
+    if matches!(raw, "overflow-auto" | "overflow-x-auto" | "overflow-y-auto") {
+        return Err(Error::UnknownClass {
+            class: raw.to_string(),
+            span: tok.span,
+            hint: Some(
+                "gpui's Overflow enum has only {Visible, Hidden, Scroll} — no Auto. \
+                 Use `overflow-{x|y}-scroll` for scrollable content (web's auto/scroll \
+                 behave the same on macOS/Linux/Windows for native UI)."
+                    .into(),
+            ),
+        });
+    }
+
+    if let Some(call) = lower_overflow(raw) {
+        return Ok(call);
+    }
+
+    if let Some(call) = lower_cursor(raw) {
+        return Ok(call);
+    }
+
+    if let Some(call) = lower_opacity(raw) {
+        return Ok(call);
+    }
+
+    if let Some(rest) = raw.strip_prefix("bg-") {
+        // Spec line 272: `bg-transparent` is a literal that lowers to
+        // `gpui::transparent_black()`, NOT a theme.transparent lookup.
+        // Has to come before the generic theme-token branch because
+        // `transparent` happens to be a valid Rust identifier.
+        if rest == "transparent" {
+            return Ok(MethodCall::unary("bg", "gpui::transparent_black()".into()));
+        }
+
+        // Theme-token alpha (`bg-<token>/<n>`) is deferred — see #23.
+        // Detect the shape and reject with an actionable hint instead
+        // of falling through to the generic UnknownClass path. Palette
+        // utilities with alpha (`bg-red-500/80`) don't match this branch
+        // (theme-token requires identifier shape) and keep their
+        // existing palette rejection through `hint_for`.
+        if let Some((token, alpha)) = rest.split_once('/') {
+            if is_theme_token(token)
+                && !alpha.is_empty()
+                && alpha.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err(Error::UnknownClass {
+                    class: raw.to_string(),
+                    span: tok.span,
+                    hint: Some(
+                        "theme-token alpha (`bg-<token>/<n>`) is not lowered yet. \
+                         The compiler doesn't know your theme's color values, so it \
+                         can't packed-RGBA them at lowering time. Use `bg-<token>` \
+                         without alpha for now, or set the alpha in your theme struct \
+                         directly. Tracked in #23."
+                            .into(),
+                    ),
+                });
+            }
+        }
+
+        if is_theme_token(rest) {
+            return Ok(MethodCall::unary("bg", format!("theme.{rest}")));
         }
     }
 
@@ -555,6 +634,65 @@ fn lower_border(raw: &str) -> Option<MethodCall> {
     }
 
     None
+}
+
+/// Lower a Tailwind overflow utility to its gpui builder method.
+/// Spec lines 336-342 enumerate exactly the seven supported variants;
+/// `overflow-auto` and friends are rejected upstream in `lower_one`
+/// because gpui's `Overflow` enum has no `Auto` value.
+fn lower_overflow(raw: &str) -> Option<MethodCall> {
+    let method = match raw {
+        "overflow-hidden" => "overflow_hidden",
+        "overflow-visible" => "overflow_visible",
+        "overflow-scroll" => "overflow_scroll",
+        "overflow-x-hidden" => "overflow_x_hidden",
+        "overflow-y-hidden" => "overflow_y_hidden",
+        "overflow-x-scroll" => "overflow_x_scroll",
+        "overflow-y-scroll" => "overflow_y_scroll",
+        _ => return None,
+    };
+    Some(MethodCall::nullary(method))
+}
+
+/// Lower a Tailwind cursor utility to its gpui builder method.
+/// Spec lines 363-373 enumerate the v0.1-supported cursor names.
+fn lower_cursor(raw: &str) -> Option<MethodCall> {
+    let suffix = raw.strip_prefix("cursor-")?;
+    let method_suffix = match suffix {
+        "default" => "default",
+        "pointer" => "pointer",
+        "text" => "text",
+        "move" => "move",
+        "grab" => "grab",
+        "grabbing" => "grabbing",
+        "not-allowed" => "not_allowed",
+        "col-resize" => "col_resize",
+        "row-resize" => "row_resize",
+        "ew-resize" => "ew_resize",
+        "ns-resize" => "ns_resize",
+        "nesw-resize" => "nesw_resize",
+        "nwse-resize" => "nwse_resize",
+        "crosshair" => "crosshair",
+        "help" => "help",
+        "none" => "none",
+        _ => return None,
+    };
+    Some(MethodCall::nullary(&format!("cursor_{method_suffix}")))
+}
+
+/// Lower a Tailwind opacity utility to `.opacity(<f>)`.
+///
+/// Spec line 361: `opacity-<n>` for `n ∈ 0..=100`. The lowered argument
+/// is rendered as `<n>.0 / 100.0` (a constant-folded f32 expression
+/// rather than a pre-computed decimal) to keep the Rust source readable
+/// and to avoid format-precision bikeshed: `opacity-50` → `50.0 / 100.0`.
+fn lower_opacity(raw: &str) -> Option<MethodCall> {
+    let n_str = raw.strip_prefix("opacity-")?;
+    let n: u32 = n_str.parse().ok()?;
+    if n > 100 {
+        return None;
+    }
+    Some(MethodCall::unary("opacity", format!("{n}.0 / 100.0")))
 }
 
 /// v0.1 spacing scale per `docs/spec.md`: contiguous 0..=12 plus the
@@ -1380,6 +1518,207 @@ mod tests {
         assert_eq!(
             lowered_method_names(&["border-2", "border-t-1", "border-dashed"]),
             vec!["border_2", "border_t_1", "border_dashed"],
+        );
+    }
+
+    // ---------- issue #15: overflow + cursor + opacity + bg-transparent ----
+
+    #[test]
+    fn lower_overflow_utilities() {
+        // All seven variants the spec lists (lines 336-342).
+        assert_eq!(
+            lowered_method_names(&[
+                "overflow-hidden",
+                "overflow-visible",
+                "overflow-scroll",
+                "overflow-x-hidden",
+                "overflow-y-hidden",
+                "overflow-x-scroll",
+                "overflow-y-scroll",
+            ]),
+            vec![
+                "overflow_hidden",
+                "overflow_visible",
+                "overflow_scroll",
+                "overflow_x_hidden",
+                "overflow_y_hidden",
+                "overflow_x_scroll",
+                "overflow_y_scroll",
+            ],
+        );
+    }
+
+    #[test]
+    fn reject_overflow_auto_with_hint() {
+        // Spec lines 348-352: gpui has no Overflow::Auto. Reject with a
+        // hint pointing at the gpui-side reason.
+        for raw in ["overflow-auto", "overflow-x-auto", "overflow-y-auto"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            match err {
+                Error::UnknownClass { class, hint, .. } => {
+                    assert_eq!(class, raw);
+                    let hint = hint.unwrap_or_default();
+                    assert!(
+                        hint.contains("Auto") || hint.contains("auto"),
+                        "hint should mention the missing Auto variant, got: {hint}"
+                    );
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lower_cursor_pointer() {
+        // The fixture-relevant case.
+        assert_eq!(
+            lowered_method_names(&["cursor-pointer"]),
+            vec!["cursor_pointer"],
+        );
+    }
+
+    #[test]
+    fn lower_all_cursor_variants_listed_in_spec() {
+        // Spec lines 363-373 enumerate these. Hyphenated suffixes
+        // (`not-allowed`, `col-resize`, ...) should produce
+        // underscore-separated method names.
+        let cases = [
+            ("cursor-default", "cursor_default"),
+            ("cursor-pointer", "cursor_pointer"),
+            ("cursor-text", "cursor_text"),
+            ("cursor-move", "cursor_move"),
+            ("cursor-grab", "cursor_grab"),
+            ("cursor-grabbing", "cursor_grabbing"),
+            ("cursor-not-allowed", "cursor_not_allowed"),
+            ("cursor-col-resize", "cursor_col_resize"),
+            ("cursor-row-resize", "cursor_row_resize"),
+            ("cursor-ew-resize", "cursor_ew_resize"),
+            ("cursor-ns-resize", "cursor_ns_resize"),
+            ("cursor-nesw-resize", "cursor_nesw_resize"),
+            ("cursor-nwse-resize", "cursor_nwse_resize"),
+            ("cursor-crosshair", "cursor_crosshair"),
+            ("cursor-help", "cursor_help"),
+            ("cursor-none", "cursor_none"),
+        ];
+        for (raw, method) in cases {
+            assert_eq!(lowered_method_names(&[raw]), vec![method.to_string()]);
+        }
+    }
+
+    #[test]
+    fn unknown_cursor_variant_is_unknown() {
+        // `cursor-zoom-in` and `cursor-wait` are real Tailwind utilities
+        // but aren't in the v0.1 spec. Keep them out until they're added
+        // explicitly.
+        for raw in ["cursor-zoom-in", "cursor-wait", "cursor-foo"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_opacity_utilities() {
+        // Boundary values + a midpoint. Argument format is "<n>.0 / 100.0"
+        // — a constant-folded Rust expression, readable and unambiguous.
+        let cases = [
+            ("opacity-0", "0.0 / 100.0"),
+            ("opacity-50", "50.0 / 100.0"),
+            ("opacity-100", "100.0 / 100.0"),
+        ];
+        for (raw, expected_arg) in cases {
+            let calls = lower_classes(&[tok(raw)]).expect("opacity should lower");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "opacity");
+            assert_eq!(calls[0].args, vec![expected_arg.to_string()]);
+        }
+    }
+
+    #[test]
+    fn out_of_range_opacity_is_unknown() {
+        // n > 100 is out of spec; non-numeric is non-numeric.
+        for raw in ["opacity-101", "opacity-200", "opacity-foo", "opacity-"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_bg_transparent_literal() {
+        // Spec line 272: `bg-transparent` is a literal, NOT a theme.transparent
+        // lookup. This was a real bug before #15 — `bg-transparent` lowered
+        // as `theme.transparent` because `is_theme_token("transparent")` is
+        // true. Pin the contract here.
+        let calls = lower_classes(&[tok("bg-transparent")]).unwrap();
+        assert_eq!(
+            calls,
+            vec![MethodCall::unary("bg", "gpui::transparent_black()".into())]
+        );
+    }
+
+    #[test]
+    fn reject_bg_token_alpha_with_hint_for_issue_23() {
+        // `bg-<theme-token>/<n>` is the Tailwind opacity-suffix shape.
+        // PR #15 deliberately defers this (see #23 for design discussion):
+        // the compiler doesn't know theme color values, so it can't packed-
+        // RGBA them. Must reject with a hint pointing at #23, not silently
+        // fall through to UnknownClass.
+        for raw in ["bg-accent/10", "bg-rose/80", "bg-surface/50"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            match err {
+                Error::UnknownClass { class, hint, .. } => {
+                    assert_eq!(class, raw);
+                    let hint = hint.unwrap_or_default();
+                    assert!(
+                        hint.contains("#23"),
+                        "opacity-suffix hint should reference #23, got: {hint}"
+                    );
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reject_palette_opacity_suffix_keeps_palette_hint() {
+        // `bg-red-500/80` is palette + alpha. The token `red-500` has a
+        // hyphen so `is_theme_token` rejects it, meaning the new
+        // theme-token-alpha branch doesn't claim it. It falls through
+        // to the existing palette UnknownClass with `hint_for`'s
+        // palette message.
+        let err = lower_classes(&[tok("bg-red-500/80")]).unwrap_err();
+        match err {
+            Error::UnknownClass { hint, .. } => {
+                let hint = hint.unwrap_or_default();
+                assert!(
+                    hint.contains("palette"),
+                    "palette+alpha should keep the palette hint, got: {hint}"
+                );
+            }
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn misc_classes_preserve_source_order() {
+        // The five #15 buckets composed: overflow + cursor + opacity +
+        // bg-transparent. Order through the lowering must match source.
+        let calls = lower_classes(&[
+            tok("overflow-y-scroll"),
+            tok("cursor-pointer"),
+            tok("opacity-50"),
+            tok("bg-transparent"),
+        ])
+        .unwrap();
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["overflow_y_scroll", "cursor_pointer", "opacity", "bg"]
         );
     }
 }
