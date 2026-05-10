@@ -314,9 +314,30 @@ border-<token>  → .border_color(theme.<token>)
 bg-transparent  → .bg(gpui::transparent_black())
 ```
 
-許可される `<token>` は theme tokens TOML が解決可能な名前のみ
-（後述）。直接色指定（`bg-red-500`, `text-[#ff0000]`, `border-blue-300`）
-は **すべて禁止**。
+`<token>` は **hyphen-separated multi-segment ident** を許可する
+(issue #7)。各 segment は `[A-Za-z_][A-Za-z0-9_]*` の形でなければなら
+ず、hyphen は lowering 時に underscore に正規化される:
+
+```text
+bg-accent             → .bg(theme.accent)
+bg-accent-foreground  → .bg(theme.accent_foreground)
+text-muted-foreground → .text_color(theme.muted_foreground)
+border-primary-hover  → .border_color(theme.primary_hover)
+```
+
+直接色指定（`bg-red-500`, `text-[#ff0000]`, `border-blue-300`）は
+**すべて禁止**。判別ルールは「最終 segment が purely numeric かどうか」:
+
+```text
+bg-red-500            → palette utility (numeric last segment) → reject
+bg-accent-foreground  → theme token (no numeric segment) → accept
+```
+
+palette と theme token の disambiguation は CSS 側 `var(--theme-X)`
+(issue #27) と utility class 側 `bg-X` (issue #7) で同じ規則を使う。
+共通 helper `class_map::normalize_theme_token` が両者を駆動するため、
+`var(--theme-accent-foreground)` と `bg-accent-foreground` は同じ Rust
+ident `theme.accent_foreground` を生成する。
 
 理由: Ato Desktop の theme、dark mode、accessibility を壊さないため。
 
