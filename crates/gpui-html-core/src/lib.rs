@@ -71,10 +71,23 @@ pub struct ParseError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseErrorKind {
+    /// `<a>...</b>` — close tag name doesn't match the open.
     UnbalancedTag { expected: String, found: String },
+    /// `</div>` at document root, or where no element is open.
+    UnexpectedClosingTag { tag: String },
+    /// `<div>` with no matching `</div>` before EOF.
     UnclosedTag,
+    /// Open tag was not closed before EOF (EOF inside `<div ...`).
+    EofInTag,
+    /// Attribute value was not double-quoted (`<div class=flex>`).
+    UnquotedAttrValue,
+    /// Attribute value used single quotes (`<div class='x'>`).
+    SingleQuotedAttrValue,
+    /// Opening `"` was found but the closing `"` never arrived.
     UnclosedAttribute,
+    /// Catch-all for "I expected character X here, found Y".
     InvalidCharacter(char),
+    /// Generic premature EOF that doesn't fit a more specific kind above.
     UnexpectedEof,
 }
 
@@ -113,7 +126,11 @@ impl Error {
 
     pub fn literal(&self) -> &str {
         match self {
-            Error::Parse(e) => &e.message,
+            Error::Parse(e) => match &e.kind {
+                ParseErrorKind::UnbalancedTag { found, .. } => found,
+                ParseErrorKind::UnexpectedClosingTag { tag } => tag,
+                _ => &e.message,
+            },
             Error::UnknownTag { tag, .. } => tag,
             Error::UnknownClass { class, .. } => class,
             Error::UnsupportedAttribute { attr, .. } => attr,

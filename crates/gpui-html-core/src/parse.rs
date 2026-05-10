@@ -73,6 +73,13 @@ impl<'src> Parser<'src> {
         let mut nodes = Vec::new();
         self.skip_ws_and_comments()?;
         while !self.at_eof() {
+            // A `</...` at document root has no matching open, so it's a
+            // hard error rather than a "let the parent handle it" sentinel.
+            // (Without this guard parse_node returns None, pos doesn't
+            // advance, and the loop spins forever.)
+            if self.peek_str("</") {
+                return Err(self.consume_unexpected_closing_tag()?);
+            }
             if let Some(node) = self.parse_node()? {
                 nodes.push(node);
             }
@@ -81,7 +88,31 @@ impl<'src> Parser<'src> {
         Ok(nodes)
     }
 
+    /// Caller has confirmed `</` is at `self.pos`. Consume the tag name and
+    /// (if present) trailing `>` so the position advances past the offending
+    /// run, then return the structured error.
+    fn consume_unexpected_closing_tag(&mut self) -> Result<Error, Error> {
+        let start = self.pos;
+        self.pos += 2;
+        let (tag, ident_span) = self.parse_identifier("expected close tag name")?;
+        // Best-effort: also consume up to and including '>' if it's right
+        // there, so the span covers the full `</foo>` literal.
+        self.skip_whitespace();
+        if self.peek() == Some('>') {
+            self.advance();
+        }
+        let span = ident_span.merge(Span::new(start, self.pos));
+        Ok(Error::Parse(ParseError {
+            kind: ParseErrorKind::UnexpectedClosingTag { tag: tag.clone() },
+            span,
+            message: format!("unexpected closing tag </{tag}> with no matching open"),
+        }))
+    }
+
     /// Returns `Ok(None)` for whitespace-only text (skipped) and for comments.
+    /// Callers that want to detect `</` at the document root must check for
+    /// it themselves before calling this; here `</` means "end of parent
+    /// element" and is left in the buffer for `parse_element` to consume.
     fn parse_node(&mut self) -> Result<Option<Node>, Error> {
         if self.peek_str("<!--") {
             self.skip_comment()?;
@@ -155,7 +186,7 @@ impl<'src> Parser<'src> {
                 }
                 None => {
                     return Err(self.err(
-                        ParseErrorKind::UnexpectedEof,
+                        ParseErrorKind::EofInTag,
                         self.pos,
                         "unexpected EOF inside open tag",
                     ));
@@ -247,12 +278,29 @@ impl<'src> Parser<'src> {
         self.advance();
         self.skip_whitespace();
         let quote_pos = self.pos;
-        if self.peek() != Some('"') {
-            return Err(self.err(
-                ParseErrorKind::UnclosedAttribute,
-                quote_pos,
-                "attribute values must be double-quoted",
-            ));
+        match self.peek() {
+            Some('"') => {} // happy path, fall through
+            Some('\'') => {
+                return Err(self.err(
+                    ParseErrorKind::SingleQuotedAttrValue,
+                    quote_pos,
+                    "attribute values must be double-quoted (gpuiHTML rejects single quotes)",
+                ));
+            }
+            Some(_) => {
+                return Err(self.err(
+                    ParseErrorKind::UnquotedAttrValue,
+                    quote_pos,
+                    "attribute values must be double-quoted",
+                ));
+            }
+            None => {
+                return Err(self.err(
+                    ParseErrorKind::EofInTag,
+                    quote_pos,
+                    "unexpected EOF after `=` — expected a double-quoted value",
+                ));
+            }
         }
         self.advance(); // consume opening "
         let value_start = self.pos;
@@ -276,7 +324,7 @@ impl<'src> Parser<'src> {
                     return Err(self.err(
                         ParseErrorKind::UnclosedAttribute,
                         quote_pos,
-                        "unclosed attribute value",
+                        "unclosed attribute value (missing closing `\"`)",
                     ));
                 }
             }
@@ -502,9 +550,87 @@ mod tests {
     fn unquoted_attribute_value_is_an_error() {
         let err = parse(r#"<div class=flex></div>"#).unwrap_err();
         match err {
-            Error::Parse(pe) => assert!(matches!(pe.kind, ParseErrorKind::UnclosedAttribute)),
-            other => panic!("expected Parse(UnclosedAttribute), got {other:?}"),
+            Error::Parse(pe) => assert!(
+                matches!(pe.kind, ParseErrorKind::UnquotedAttrValue),
+                "expected UnquotedAttrValue, got {:?}",
+                pe.kind
+            ),
+            other => panic!("expected Parse error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn single_quoted_attribute_value_is_a_distinct_error() {
+        let err = parse(r#"<div class='flex'></div>"#).unwrap_err();
+        match err {
+            Error::Parse(pe) => assert!(
+                matches!(pe.kind, ParseErrorKind::SingleQuotedAttrValue),
+                "expected SingleQuotedAttrValue, got {:?}",
+                pe.kind
+            ),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unclosed_double_quoted_attribute_is_unclosed_attribute() {
+        let err = parse(r#"<div class="flex"#).unwrap_err();
+        match err {
+            Error::Parse(pe) => assert!(
+                matches!(pe.kind, ParseErrorKind::UnclosedAttribute),
+                "expected UnclosedAttribute, got {:?}",
+                pe.kind
+            ),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eof_inside_open_tag_is_eof_in_tag() {
+        let err = parse("<div ").unwrap_err();
+        match err {
+            Error::Parse(pe) => assert!(
+                matches!(pe.kind, ParseErrorKind::EofInTag),
+                "expected EofInTag, got {:?}",
+                pe.kind
+            ),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_closing_tag_is_unexpected_closing_tag() {
+        let err = parse("</div>").unwrap_err();
+        match err {
+            Error::Parse(pe) => match pe.kind {
+                ParseErrorKind::UnexpectedClosingTag { tag } => assert_eq!(tag, "div"),
+                other => panic!("expected UnexpectedClosingTag, got {other:?}"),
+            },
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closing_tag_before_open_in_sibling_position_is_unexpected_closing() {
+        // The first thing the parser sees is `</span>`, which has no
+        // matching open. This must surface as UnexpectedClosingTag, not
+        // as an infinite loop or a misleading UnbalancedTag.
+        let err = parse("</span><div></div>").unwrap_err();
+        match err {
+            Error::Parse(pe) => match pe.kind {
+                ParseErrorKind::UnexpectedClosingTag { tag } => assert_eq!(tag, "span"),
+                other => panic!("expected UnexpectedClosingTag, got {other:?}"),
+            },
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unexpected_closing_tag_carries_source_span() {
+        let src = "</div>";
+        let err = parse(src).unwrap_err();
+        let span = err.span();
+        assert_eq!(&src[span.start..span.end], "</div>");
     }
 
     #[test]
