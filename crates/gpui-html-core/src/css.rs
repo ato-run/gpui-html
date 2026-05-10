@@ -92,20 +92,36 @@ pub fn parse_stylesheet(css: &str, base_offset: usize) -> Result<Stylesheet, Err
 /// Lower a parsed stylesheet into the class -> MethodCalls map that
 /// codegen consumes.
 ///
-/// Hard fails on the first declaration that can't be lowered. Future
-/// work may switch this to a collect-and-warn model so unsupported
-/// rules don't block the rest of the document from compiling, but for
-/// v0.1 the strict-fail behavior keeps the diagnostic story simple.
+/// Lower a parsed stylesheet to the class -> MethodCalls map.
+///
+/// **Lenient mode**: declarations that don't lower (unsupported
+/// property, out-of-range value) are silently skipped rather than
+/// failing the whole compile. The v0.1 design admits real-world
+/// `<style>` blocks (Tailwind preview resets, vendor `::-webkit-*`
+/// rules, etc.) the same way the document layer admits DOCTYPE and
+/// wrappers: accept the input, lower nothing, move on. Hard
+/// `Result<_, Error>` is reserved for malformed structure
+/// (`parse_stylesheet` raises those) — at this stage every rule is
+/// already syntactically valid.
 pub fn lower_stylesheet(sheet: &Stylesheet) -> Result<StyleMap, Error> {
     let mut map: StyleMap = HashMap::new();
     for rule in &sheet.rules {
         let mut calls = Vec::new();
         for decl in &rule.declarations {
-            calls.extend(lower_declaration(decl)?);
+            // Skip silently on per-declaration lowering failure. The
+            // diagnostic isn't lost — the host can re-run with
+            // `cargo run --bin gpui-html-lint` (future) to surface
+            // the per-rule warnings; for v0.1, "compile what you
+            // can" wins over "block on first unsupported rule".
+            if let Ok(decl_calls) = lower_declaration(decl) {
+                calls.extend(decl_calls);
+            }
         }
-        map.entry(rule.class_name.clone())
-            .or_default()
-            .extend(calls);
+        if !calls.is_empty() {
+            map.entry(rule.class_name.clone())
+                .or_default()
+                .extend(calls);
+        }
     }
     Ok(map)
 }
@@ -191,21 +207,47 @@ impl<'src> Parser<'src> {
         let mut rules = Vec::new();
         self.skip_ws_and_comments()?;
         while !self.at_eof() {
-            // At-rules (`@media`, `@keyframes`, etc.) and selector forms
-            // we don't support both surface as `UnsupportedSelector` so
-            // diagnostics point at the same span as a normal rule head.
+            // Both at-rules and unsupported-selector rules are skipped
+            // silently in lenient mode — the body is consumed up to its
+            // matching `}` and the rule simply doesn't enter the IR.
+            // Hard errors are reserved for *malformed* structure
+            // (mismatched braces, EOF mid-rule).
             if self.peek() == Some('@') {
-                return Err(self.unsupported_selector_at_pos("at-rules"));
+                self.skip_unsupported_rule()?;
+                self.skip_ws_and_comments()?;
+                continue;
             }
-            rules.push(self.parse_rule()?);
+            if let Some(rule) = self.parse_rule()? {
+                rules.push(rule);
+            }
             self.skip_ws_and_comments()?;
         }
         Ok(Stylesheet { rules })
     }
 
-    fn parse_rule(&mut self) -> Result<Rule, Error> {
+    /// Parse one rule. Returns `Ok(None)` if the rule head is something
+    /// the v0.1 subset doesn't lower (anything other than a single
+    /// `.<class>` selector); the rule body is consumed up to `}` so
+    /// the caller's loop can keep parsing what comes after. Hard
+    /// errors are reserved for malformed structure.
+    fn parse_rule(&mut self) -> Result<Option<Rule>, Error> {
         let rule_start = self.pos;
-        let (class_name, class_name_span) = self.parse_class_selector()?;
+
+        let (class_name, class_name_span) = match self.parse_class_selector() {
+            Ok(named) => named,
+            Err(Error::Css(_)) => {
+                // Lenient mode: any selector shape v0.1 doesn't accept
+                // (universal, type, id, pseudo, compound, list,
+                // descendant) is consumed as a discarded rule rather
+                // than blocking the whole stylesheet. This is the same
+                // compromise the document layer takes for DOCTYPE /
+                // wrappers / metadata: keep going.
+                self.skip_unsupported_rule()?;
+                return Ok(None);
+            }
+            Err(other) => return Err(other),
+        };
+
         self.skip_ws_and_comments()?;
         if self.peek() != Some('{') {
             return Err(Error::Css(CssError {
@@ -237,12 +279,98 @@ impl<'src> Parser<'src> {
             }
         }
 
-        Ok(Rule {
+        Ok(Some(Rule {
             class_name,
             class_name_span,
             declarations,
             span: self.span(rule_start, self.pos),
-        })
+        }))
+    }
+
+    /// Consume an unsupported rule's head and body. Used when the rule
+    /// shape isn't in the v0.1 subset (at-rules, type/id/universal/
+    /// pseudo selectors, etc.). Walks forward through the source
+    /// tracking brace depth, so `@media (...) { .a { ... } .b { ... } }`
+    /// gets eaten as a single block. Hard-fails on EOF before the
+    /// matching close brace (that's malformed structure).
+    fn skip_unsupported_rule(&mut self) -> Result<(), Error> {
+        let start = self.pos;
+        // Walk to the first `{` (consumes the selector head + any
+        // whitespace/comments inside). Strings and parens inside the
+        // selector head don't appear in v0.1-shape sources, so a
+        // simple `find {` is enough for typical Tailwind preview
+        // resets.
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(Error::Css(CssError {
+                        kind: CssErrorKind::MalformedRule,
+                        span: self.span(start, self.pos),
+                        message: "unclosed unsupported rule — no `{` before EOF".into(),
+                    }));
+                }
+                Some('{') => {
+                    self.advance();
+                    break;
+                }
+                Some(';') => {
+                    // At-rule statement form (e.g. `@charset "...";`).
+                    // No body — just consume the semicolon and return.
+                    self.advance();
+                    return Ok(());
+                }
+                Some(_) => {
+                    self.advance();
+                }
+            }
+        }
+        // Brace-balanced consume to the matching `}`. CSS strings can
+        // contain unmatched braces, so handle `"..."` and `'...'`
+        // groups specially (track open quotes; ignore braces inside).
+        let mut depth: u32 = 1;
+        let mut in_string: Option<char> = None;
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(Error::Css(CssError {
+                        kind: CssErrorKind::MalformedRule,
+                        span: self.span(start, self.pos),
+                        message: "unclosed unsupported rule — missing `}`".into(),
+                    }));
+                }
+                Some(c) => {
+                    if let Some(q) = in_string {
+                        if c == q {
+                            in_string = None;
+                        } else if c == '\\' {
+                            self.advance(); // skip the escape
+                        }
+                        self.advance();
+                        continue;
+                    }
+                    match c {
+                        '"' | '\'' => {
+                            in_string = Some(c);
+                            self.advance();
+                        }
+                        '{' => {
+                            depth += 1;
+                            self.advance();
+                        }
+                        '}' => {
+                            depth -= 1;
+                            self.advance();
+                            if depth == 0 {
+                                return Ok(());
+                            }
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Parse a single class selector (`.foo` / `.foo-bar` / `.foo_1`).
@@ -779,75 +907,71 @@ mod tests {
     }
 
     #[test]
-    fn reject_descendant_selector_with_hint() {
-        let err = parse_stylesheet(".foo .bar { display: flex; }", 0).unwrap_err();
-        match err {
-            Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedSelector { selector },
-                ..
-            }) => {
-                assert!(
-                    selector.contains(".foo"),
-                    "selector should include `.foo`, got {selector:?}"
-                );
-            }
-            other => panic!("expected UnsupportedSelector, got {other:?}"),
-        }
+    fn descendant_selector_skipped_silently() {
+        // Lenient mode: unsupported selectors are skipped, the rest of
+        // the stylesheet keeps parsing. Pinned by checking that a
+        // following supported rule still ends up in the IR.
+        let sheet = parse_ok(
+            ".foo .bar { display: flex; }\n\
+             .accepted { display: flex; }",
+        );
+        let class_names: Vec<&str> = sheet.rules.iter().map(|r| r.class_name.as_str()).collect();
+        assert_eq!(class_names, vec!["accepted"]);
     }
 
     #[test]
-    fn reject_pseudo_selector_with_hint() {
-        let err = parse_stylesheet(".foo:hover { color: red; }", 0).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedSelector { .. },
-                ..
-            })
-        ));
+    fn pseudo_selector_skipped_silently() {
+        let sheet = parse_ok(".foo:hover { color: red; } .bar { display: flex; }");
+        let class_names: Vec<&str> = sheet.rules.iter().map(|r| r.class_name.as_str()).collect();
+        assert_eq!(class_names, vec!["bar"]);
     }
 
     #[test]
-    fn reject_compound_selector() {
-        let err = parse_stylesheet(".foo.bar { color: red; }", 0).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedSelector { .. },
-                ..
-            })
-        ));
+    fn compound_selector_skipped_silently() {
+        let sheet = parse_ok(".foo.bar { color: red; } .ok { display: flex; }");
+        let class_names: Vec<&str> = sheet.rules.iter().map(|r| r.class_name.as_str()).collect();
+        assert_eq!(class_names, vec!["ok"]);
     }
 
     #[test]
-    fn reject_id_and_type_selectors() {
-        for css in [
+    fn id_type_universal_selectors_skipped_silently() {
+        // The Tailwind-preview / browser-reset shapes that v0.1 doesn't
+        // lower. All three must skip without blocking the trailing
+        // accepted rule.
+        for prelude in [
             "#root { color: red; }",
             "div { color: red; }",
             "* { color: red; }",
+            "html, body { margin: 0; }",
+            "::-webkit-scrollbar { width: 5px; }",
         ] {
-            let err = parse_stylesheet(css, 0).unwrap_err();
-            assert!(matches!(
-                err,
-                Error::Css(CssError {
-                    kind: CssErrorKind::UnsupportedSelector { .. },
-                    ..
-                }),
-            ));
+            let css = format!("{prelude}\n.ok {{ display: flex; }}");
+            let sheet = parse_ok(&css);
+            let names: Vec<&str> = sheet.rules.iter().map(|r| r.class_name.as_str()).collect();
+            assert_eq!(names, vec!["ok"], "for prelude {prelude:?}");
         }
     }
 
     #[test]
-    fn reject_at_rule_with_hint() {
-        let err =
-            parse_stylesheet("@media (min-width: 100px) { .foo { color: red; } }", 0).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedSelector { .. },
-                ..
-            })
-        ));
+    fn at_rule_skipped_silently_with_brace_balance() {
+        // `@media` has nested braces — the skip-rule helper must
+        // brace-balance, not stop at the first `}` (which would leave
+        // the inner `.foo` rule's body partially consumed and break
+        // parsing of what follows).
+        let sheet = parse_ok(
+            "@media (min-width: 100px) { .foo { color: red; } }\n\
+             .accepted { display: flex; }",
+        );
+        let names: Vec<&str> = sheet.rules.iter().map(|r| r.class_name.as_str()).collect();
+        assert_eq!(names, vec!["accepted"]);
+    }
+
+    #[test]
+    fn at_charset_statement_skipped_silently() {
+        // At-rule statement form (no body, terminated by `;`).
+        let sheet = parse_ok(r#"@charset "utf-8"; .ok { display: flex; }"#);
+        let names: Vec<&str> = sheet.rules.iter().map(|r| r.class_name.as_str()).collect();
+        assert_eq!(names, vec!["ok"]);
     }
 
     #[test]
@@ -864,11 +988,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_selector_span_is_absolute() {
-        // base_offset = 100 means CSS source starts 100 bytes into a
-        // hypothetical HTML document. Diagnostic spans must be in
-        // document coordinates, not CSS-local coordinates.
-        let err = parse_stylesheet(".foo:hover { color: red; }", 100).unwrap_err();
+    fn malformed_structure_still_hard_fails_with_absolute_span() {
+        // After lenient mode, *unsupported* CSS is silently skipped,
+        // but *malformed* CSS still hard-fails. Pin both that the
+        // failure happens and that the span is translated to the
+        // absolute document offset (base_offset = 100).
+        let err = parse_stylesheet(".foo { color red }", 100).unwrap_err();
         let span = err.span();
         assert!(
             span.start >= 100 && span.end > span.start,
@@ -957,49 +1082,52 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_css_declaration_reports_span() {
-        // `font-family` isn't lowered. Span should point at the
-        // property name for editor highlighting.
-        let css = ".x { font-family: Inter; }";
-        let err = parse_and_lower(css, 0).unwrap_err();
-        match err {
-            Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedDeclaration { property },
-                span,
-                ..
-            }) => {
-                assert_eq!(property, "font-family");
-                assert_eq!(&css[span.start..span.end], "font-family");
-            }
-            other => panic!("expected UnsupportedDeclaration, got {other:?}"),
-        }
+    fn unsupported_declaration_skipped_silently_within_a_rule() {
+        // `font-family` isn't lowered. Lenient mode: the rest of the
+        // rule still applies. Other declarations in the same `.x`
+        // rule end up in the StyleMap; the unsupported one is dropped.
+        let map = lower_ok(".x { font-family: Inter; padding: 1rem; }");
+        assert_eq!(methods_for(&map, "x"), vec!["p_4"]);
     }
 
     #[test]
-    fn unsupported_css_value_reports_span() {
-        // `padding: 1.7rem` is a valid property, invalid scale step.
-        let css = ".x { padding: 1.7rem; }";
-        let err = parse_and_lower(css, 0).unwrap_err();
-        match err {
-            Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedValue { property, value },
-                ..
-            }) => {
-                assert_eq!(property, "padding");
-                assert_eq!(value, "1.7rem");
-            }
-            other => panic!("expected UnsupportedValue, got {other:?}"),
-        }
+    fn unsupported_value_skipped_silently_within_a_rule() {
+        // `padding: 1.7rem` is a valid property, invalid scale step —
+        // skipped. The other declaration applies.
+        let map = lower_ok(".x { padding: 1.7rem; gap: 0.5rem; }");
+        assert_eq!(methods_for(&map, "x"), vec!["gap_2"]);
     }
 
     #[test]
-    fn direct_color_literal_is_unsupported_value() {
-        // `color: #fff` is rejected — host theme is the source of truth.
-        let err = parse_and_lower(".x { color: #fff; }", 0).unwrap_err();
+    fn direct_color_literal_skipped_silently() {
+        // Browser-shape Tailwind preview rules use direct hex colors.
+        // Skip them; the rest of the rule (or the rest of the
+        // stylesheet) keeps lowering.
+        let map = lower_ok(".x { color: #fff; padding: 1rem; }");
+        assert_eq!(methods_for(&map, "x"), vec!["p_4"]);
+    }
+
+    #[test]
+    fn rule_with_only_unsupported_declarations_does_not_appear_in_map() {
+        // If every declaration in a rule is unsupported, the rule
+        // simply doesn't get a StyleMap entry — there's nothing to
+        // bind to a class= attribute.
+        let map = lower_ok(".x { font-family: Inter; color: red; }");
+        assert!(
+            !map.contains_key("x"),
+            "rule with no lowered declarations should not appear in StyleMap, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_declaration_still_hard_fails() {
+        // Lenient mode is for *unsupported* CSS, not *malformed* CSS.
+        // Mismatched braces / missing colons stay hard errors.
+        let err = parse_and_lower(".x { color red }", 0).unwrap_err();
         assert!(matches!(
             err,
             Error::Css(CssError {
-                kind: CssErrorKind::UnsupportedValue { .. },
+                kind: CssErrorKind::MalformedDeclaration,
                 ..
             })
         ));
