@@ -107,6 +107,25 @@
 //!   Theme-token alpha (`bg-<token>/<n>`) is **deferred** — see #23 for
 //!   the design discussion. Rejected with a hint that points at the
 //!   issue, not silently treated as a normal theme token.
+//!
+//! Radius:
+//!   rounded                -> .rounded_md()             (bare = md)
+//!   rounded-{none,sm,md,lg,xl,2xl,3xl,full}
+//!                          -> .rounded_<suffix>()
+//!   rounded-{t,r,b,l}-<suffix>
+//!                          -> .rounded_<side>_<suffix>()
+//!   rounded-{tl,tr,bl,br}-<suffix>
+//!                          -> .rounded_<corner>_<suffix>()
+//!
+//!   Bare directional (`rounded-t`, `rounded-tl`, ...) rejects — the
+//!   spec doesn't list a default-suffix behavior for directional radius.
+//!
+//! Shadow:
+//!   shadow                 -> .shadow_md()              (bare = md)
+//!   shadow-{sm,md,lg,xl,2xl,none}
+//!                          -> .shadow_<suffix>()
+//!
+//!   `shadow-3xl` rejects (the spec stops shadow at 2xl).
 //! ```
 //!
 //! Anything else surfaces as [`Error::UnknownClass`] with the offending
@@ -247,6 +266,14 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(call) = lower_opacity(raw) {
+        return Ok(call);
+    }
+
+    if let Some(call) = lower_radius(raw) {
+        return Ok(call);
+    }
+
+    if let Some(call) = lower_shadow(raw) {
         return Ok(call);
     }
 
@@ -693,6 +720,82 @@ fn lower_opacity(raw: &str) -> Option<MethodCall> {
         return None;
     }
     Some(MethodCall::unary("opacity", format!("{n}.0 / 100.0")))
+}
+
+/// Lower a Tailwind border-radius utility to its gpui builder method.
+/// Spec lines 253-257 enumerate the bare keyword (= md) plus named
+/// suffixes plus directional/corner variants.
+///
+/// Disambiguation: corner prefixes (`tl-`, `tr-`, `bl-`, `br-`) must
+/// be tried before side prefixes (`t-`, `r-`, `b-`, `l-`) so
+/// `rounded-tl-md` is parsed as a corner, not as side `t` with suffix
+/// `l-md`. Implemented by listing corners first in the SIDES table.
+fn lower_radius(raw: &str) -> Option<MethodCall> {
+    if raw == "rounded" {
+        return Some(MethodCall::nullary("rounded_md"));
+    }
+
+    let rest = raw.strip_prefix("rounded-")?;
+
+    const SIDES: &[(&str, &str)] = &[
+        // Corners first (longest-prefix wins)
+        ("tl-", "tl_"),
+        ("tr-", "tr_"),
+        ("bl-", "bl_"),
+        ("br-", "br_"),
+        // Sides
+        ("t-", "t_"),
+        ("r-", "r_"),
+        ("b-", "b_"),
+        ("l-", "l_"),
+    ];
+    for (prefix, method_prefix) in SIDES {
+        if let Some(suffix) = rest.strip_prefix(prefix) {
+            return radius_suffix_to_method_suffix(suffix)
+                .map(|m| MethodCall::nullary(&format!("rounded_{method_prefix}{m}")));
+        }
+    }
+
+    // Plain suffix: rounded-<suffix>
+    radius_suffix_to_method_suffix(rest).map(|m| MethodCall::nullary(&format!("rounded_{m}")))
+}
+
+/// Map a radius suffix string to its method-name suffix. Returns
+/// `None` for any suffix outside the spec-enumerated set, including
+/// the empty string (so a bare directional like `rounded-t` rejects).
+fn radius_suffix_to_method_suffix(suffix: &str) -> Option<&'static str> {
+    let m = match suffix {
+        "none" => "none",
+        "sm" => "sm",
+        "md" => "md",
+        "lg" => "lg",
+        "xl" => "xl",
+        "2xl" => "2xl",
+        "3xl" => "3xl",
+        "full" => "full",
+        _ => return None,
+    };
+    Some(m)
+}
+
+/// Lower a Tailwind shadow utility to its gpui builder method.
+/// Spec line 260 lists `sm / md / lg / xl / 2xl / none` (no `3xl`),
+/// and the bare `shadow` resolves to `shadow_md` per line 259.
+fn lower_shadow(raw: &str) -> Option<MethodCall> {
+    if raw == "shadow" {
+        return Some(MethodCall::nullary("shadow_md"));
+    }
+    let suffix = raw.strip_prefix("shadow-")?;
+    let method_suffix = match suffix {
+        "sm" => "sm",
+        "md" => "md",
+        "lg" => "lg",
+        "xl" => "xl",
+        "2xl" => "2xl",
+        "none" => "none",
+        _ => return None,
+    };
+    Some(MethodCall::nullary(&format!("shadow_{method_suffix}")))
 }
 
 /// v0.1 spacing scale per `docs/spec.md`: contiguous 0..=12 plus the
@@ -1719,6 +1822,175 @@ mod tests {
         assert_eq!(
             names,
             vec!["overflow_y_scroll", "cursor_pointer", "opacity", "bg"]
+        );
+    }
+
+    // ---------- issue #16: radius + shadow --------------------------------
+
+    #[test]
+    fn lower_bare_radius_and_named_radius_suffixes() {
+        // Bare `rounded` resolves to md (spec line 253). Each named
+        // suffix lowers as itself.
+        assert_eq!(
+            lowered_method_names(&[
+                "rounded",
+                "rounded-none",
+                "rounded-sm",
+                "rounded-md",
+                "rounded-lg",
+                "rounded-xl",
+                "rounded-2xl",
+                "rounded-3xl",
+                "rounded-full",
+            ]),
+            vec![
+                "rounded_md",
+                "rounded_none",
+                "rounded_sm",
+                "rounded_md",
+                "rounded_lg",
+                "rounded_xl",
+                "rounded_2xl",
+                "rounded_3xl",
+                "rounded_full",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_directional_radius_utilities() {
+        // Sides: t / r / b / l (spec line 256).
+        assert_eq!(
+            lowered_method_names(&[
+                "rounded-t-md",
+                "rounded-r-lg",
+                "rounded-b-sm",
+                "rounded-l-full",
+                "rounded-t-2xl",
+            ]),
+            vec![
+                "rounded_t_md",
+                "rounded_r_lg",
+                "rounded_b_sm",
+                "rounded_l_full",
+                "rounded_t_2xl",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_corner_radius_utilities() {
+        // Corners: tl / tr / bl / br (spec line 257). Crucially these
+        // must take precedence over single-side prefixes — e.g.
+        // `rounded-tl-md` is corner top-left, not side `t` with
+        // suffix `l-md`.
+        assert_eq!(
+            lowered_method_names(&[
+                "rounded-tl-md",
+                "rounded-tr-lg",
+                "rounded-bl-sm",
+                "rounded-br-full",
+                "rounded-tr-3xl",
+            ]),
+            vec![
+                "rounded_tl_md",
+                "rounded_tr_lg",
+                "rounded_bl_sm",
+                "rounded_br_full",
+                "rounded_tr_3xl",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_bare_shadow_and_named_shadow_suffixes() {
+        // Bare `shadow` resolves to md (spec line 259). Spec line 260
+        // lists sm/md/lg/xl/2xl/none — no 3xl.
+        assert_eq!(
+            lowered_method_names(&[
+                "shadow",
+                "shadow-sm",
+                "shadow-md",
+                "shadow-lg",
+                "shadow-xl",
+                "shadow-2xl",
+                "shadow-none",
+            ]),
+            vec![
+                "shadow_md",
+                "shadow_sm",
+                "shadow_md",
+                "shadow_lg",
+                "shadow_xl",
+                "shadow_2xl",
+                "shadow_none",
+            ],
+        );
+    }
+
+    #[test]
+    fn reject_unknown_radius_suffix() {
+        // Invalid suffix, invalid side, bare directional, and unknown
+        // tail — all must surface as UnknownClass without lowering.
+        for raw in [
+            "rounded-4xl",       // suffix not in spec
+            "rounded-middle-md", // invalid pseudo-side
+            "rounded-t",         // bare directional, no spec backing
+            "rounded-tl",        // bare corner, no spec backing
+            "rounded-l-4xl",     // valid side, invalid suffix
+            "rounded-foo",       // unknown plain suffix
+        ] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unknown_shadow_suffix() {
+        // Spec stops shadow at 2xl — `shadow-3xl` rejects. Other shapes
+        // (typo, pseudo-side, etc.) also reject.
+        for raw in [
+            "shadow-3xl",   // out of spec
+            "shadow-large", // wrong vocabulary
+            "shadow-t-md",  // shadow has no directional form
+            "shadow-foo",
+        ] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn radius_2xl_and_3xl_tokenize_cleanly() {
+        // The tokenizer keeps `2xl`/`3xl` as single suffixes (no
+        // accidental split on the digit). Drive end-to-end through
+        // parse + lower so both layers are pinned together.
+        let nodes =
+            crate::parse::parse(r#"<div class="rounded-2xl rounded-tr-3xl"></div>"#).unwrap();
+        let crate::ast::Node::Element(e) = &nodes[0] else {
+            panic!("expected element");
+        };
+        let raws: Vec<&str> = e.classes.iter().map(|c| c.raw.as_str()).collect();
+        assert_eq!(raws, vec!["rounded-2xl", "rounded-tr-3xl"]);
+
+        let calls = lower_classes(&e.classes).expect("classes should lower");
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["rounded_2xl", "rounded_tr_3xl"]);
+    }
+
+    #[test]
+    fn radius_and_shadow_preserve_source_order() {
+        // Mixed radius variants and shadow keep source order through
+        // lowering.
+        assert_eq!(
+            lowered_method_names(&["rounded-lg", "shadow-lg", "rounded-tr-md", "shadow"]),
+            vec!["rounded_lg", "shadow_lg", "rounded_tr_md", "shadow_md"],
         );
     }
 }
