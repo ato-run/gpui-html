@@ -235,12 +235,35 @@ min-w-<n>       → .min_w_<n>()
 min-h-<n>       → .min_h_<n>()
 max-w-<n>       → .max_w_<n>()
 max-h-<n>       → .max_h_<n>()
-w-full / h-full / size-full → .w_full() / .h_full() / .size_full()
-w-auto / h-auto             → .w_auto() / .h_auto()
-w-1/2, w-1/3, w-2/3, w-3/4  → .w_1_2() / .w_1_3() / .w_2_3() / .w_3_4()
+w-full / h-full / size-full   → .w_full() / .h_full() / .size_full()
+w-auto / h-auto               → .w_auto() / .h_auto()
+w-screen / h-screen / size-screen
+                              → .w_screen() / .h_screen() / .size_screen()
+w-1/2, w-1/3, w-2/3, w-3/4    → .w_1_2() / .w_1_3() / .w_2_3() / .w_3_4()
 ```
 
 `<n>` は spacing scale と同じ。`13`, `14`, `15` は禁止。
+
+#### App-shell compatibility tokens (#19)
+
+Tailwind config-extended scales are not generally supported in v0.1
+(custom-token manifest is v0.2 territory). One exemption ships in v0.1
+to keep the Ato Desktop preview fixture compileable end-to-end:
+
+```text
+max-w-128       → .max_w(rems(32.0))     (v0.1 compat)
+```
+
+This single token mirrors `maxWidth: { '128': '32rem' }` in the
+preview's Tailwind config. Anything else under `max-w-/max-h-/min-w-/
+min-h-` that doesn't match the v0.1 spacing scale (e.g. `max-w-200`,
+`max-w-card`) reports `UnsupportedClass` with a hint pointing at the
+v0.2 manifest direction.
+
+The v0.2 manifest will replace this single-token exemption with a
+proper host-side declaration: the host app declares custom sizing
+tokens in a manifest file, and the compiler reads it. Until then,
+`max-w-128` is the only token we admit.
 
 ### Spacing
 
@@ -379,6 +402,30 @@ truncate        → .truncate()
 `font-*` と `leading-*` は `Styled` 上の shorthand method が **存在しない**
 ので、codegen 側で `font_weight(FontWeight::*)` と `line_height(rems(...))`
 へ展開する。これは v0.1 spec の暗黙のコード生成ルールである。
+
+#### `font-sans` no-op (#19)
+
+Font-family is a host-app responsibility, not a per-element style:
+gpui apps configure their font stack on the `Theme` or app shell once,
+not on every `<div>`. v0.1 therefore does **not** lower font-family
+utilities to GPUI builder calls.
+
+For Tailwind preview compatibility, `font-sans` is accepted as a
+**recognized no-op**: the class doesn't error (so the Ato Desktop
+preview fixture compiles end-to-end), but no MethodCall is emitted.
+Source order of other classes is preserved; the no-op simply
+disappears from the lowered output.
+
+```text
+font-sans       → (no-op; recognized for Tailwind compat, no GPUI call)
+font-mono       → UnsupportedClass + hint
+font-serif      → UnsupportedClass + hint
+```
+
+`font-mono` and `font-serif` reject because in practice each gpui
+app's `Theme` declares one font-family at a time; admitting them as
+no-ops too would create the false impression that switching is
+per-element.
 
 禁止。
 

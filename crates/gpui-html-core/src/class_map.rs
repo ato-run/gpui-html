@@ -219,10 +219,17 @@ pub fn lower_classes_with_styles(
 
     // Phase 2: utility lowerings. Classes that are unknown utilities
     // but DO have a stylesheet rule (Phase 1 already handled them)
-    // pass silently here.
+    // pass silently here. Recognized no-op classes (e.g. `font-sans`,
+    // accepted for Tailwind preview compatibility but lowering to no
+    // GPUI builder call — see #19) also pass silently: they appear in
+    // source order but emit nothing.
     for cls in classes {
         match lower_one(cls) {
-            Ok(call) => result.push(call),
+            Ok(Some(call)) => result.push(call),
+            Ok(None) => {
+                // Recognized no-op (e.g. font-sans). Source position is
+                // honoured by the iteration but no MethodCall is emitted.
+            }
             Err(Error::UnknownClass { .. }) if style_map.contains_key(&cls.raw) => {
                 // Already covered by Phase 1; not really an unknown class.
             }
@@ -233,8 +240,27 @@ pub fn lower_classes_with_styles(
     Ok(result)
 }
 
-fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
+/// Lower one class to either a method call, a recognized no-op, or
+/// an `UnknownClass` error.
+///
+/// `Ok(Some(call))` is the common case — the class has a builder
+/// method to splice into the chain.
+///
+/// `Ok(None)` is a "recognized no-op": the class is explicitly accepted
+/// (so callers don't get `UnknownClass`) but has no GPUI builder
+/// equivalent. v0.1 uses this for `font-sans`, where font-family lives
+/// at the gpui app/Theme level rather than per-element. See #19 for
+/// the design discussion.
+fn lower_one(tok: &ClassToken) -> Result<Option<MethodCall>, Error> {
     let raw = tok.raw.as_str();
+
+    // Recognized no-op classes: accepted for Tailwind preview compat
+    // (so callers don't get UnknownClass) but lower to no GPUI builder
+    // call. See #19. Currently just `font-sans` — font-family is an
+    // app-shell / Theme concern in gpui, not a per-element class.
+    if is_noop_class(raw) {
+        return Ok(None);
+    }
 
     // Spec line 179-181: inline-flex and items-stretch are explicitly out
     // of scope (no matching `Styled` shorthand). Reject with a hint that
@@ -269,15 +295,15 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(call) = lower_layout_keyword(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_spacing(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_sizing(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     // Typography utilities the spec deliberately rejects (with reasons):
@@ -294,11 +320,11 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(call) = lower_typography(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_border(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     // Spec lines 348-352: gpui has no Overflow::Auto. Reject before
@@ -318,23 +344,23 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(call) = lower_overflow(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_cursor(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_opacity(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_radius(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(call) = lower_shadow(raw) {
-        return Ok(call);
+        return Ok(Some(call));
     }
 
     if let Some(rest) = raw.strip_prefix("bg-") {
@@ -343,7 +369,10 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         // Has to come before the generic theme-token branch because
         // `transparent` happens to be a valid Rust identifier.
         if rest == "transparent" {
-            return Ok(MethodCall::unary("bg", "gpui::transparent_black()".into()));
+            return Ok(Some(MethodCall::unary(
+                "bg",
+                "gpui::transparent_black()".into(),
+            )));
         }
 
         // Theme-token alpha (`bg-<token>/<n>`) is deferred — see #23.
@@ -373,7 +402,7 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         }
 
         if let Some(normalized) = normalize_theme_token(rest) {
-            return Ok(MethodCall::unary("bg", format!("theme.{normalized}")));
+            return Ok(Some(MethodCall::unary("bg", format!("theme.{normalized}"))));
         }
     }
 
@@ -383,10 +412,10 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         // color theme token — possibly hyphenated, normalized to
         // snake_case for the Rust field access.
         if let Some(normalized) = normalize_theme_token(token) {
-            return Ok(MethodCall::unary(
+            return Ok(Some(MethodCall::unary(
                 "text_color",
                 format!("theme.{normalized}"),
-            ));
+            )));
         }
     }
 
@@ -510,6 +539,15 @@ fn lower_sizing(raw: &str) -> Option<MethodCall> {
         return Some(call);
     }
 
+    // App-shell compatibility (#19): `max-w-128` is the only custom-scale
+    // sizing token v0.1 recognizes. The Ato Desktop preview's Tailwind
+    // config defines `128 = 32rem` and the fixture relies on it. Any
+    // other `max-w-<custom>` (e.g. `max-w-card`, `max-w-200`) falls
+    // through and gets the v0.2-manifest hint via `hint_for`.
+    if raw == "max-w-128" {
+        return Some(MethodCall::unary("max_w", "rems(32.0)".into()));
+    }
+
     // Numeric prefixes — longest-first within each axis so `min-w-` and
     // `max-w-` are tried before bare `w-`, and `size-` before `s-`-shaped
     // future prefixes (none exist today; ordering is defensive).
@@ -533,9 +571,8 @@ fn lower_sizing(raw: &str) -> Option<MethodCall> {
 
 /// Flat identity map for the non-numeric sizing utilities the spec
 /// enumerates: `w-full` / `h-full` / `size-full`, `w-auto` / `h-auto`,
-/// and the four fractional widths. Anything else (`w-screen`, `w-1/5`,
-/// `w-1/4`) falls through to `UnknownClass` because the spec doesn't
-/// list it.
+/// the four fractional widths, and (added in #19) the viewport keywords
+/// `w-screen` / `h-screen` / `size-screen`.
 ///
 /// Tokenizer note: `w-1/2` arrives here as a single class token because
 /// `split_classes` only splits on whitespace. The `/` is preserved
@@ -548,6 +585,11 @@ fn lower_sizing_keyword(raw: &str) -> Option<MethodCall> {
         "size-full" => "size_full",
         "w-auto" => "w_auto",
         "h-auto" => "h_auto",
+        // Viewport keywords (#19) — gpui's `Styled` exposes
+        // `w_screen()` / `h_screen()` / `size_screen()` directly.
+        "w-screen" => "w_screen",
+        "h-screen" => "h_screen",
+        "size-screen" => "size_screen",
         "w-1/2" => "w_1_2",
         "w-1/3" => "w_1_3",
         "w-2/3" => "w_2_3",
@@ -656,11 +698,13 @@ fn typography_rejection_hint(raw: &str) -> Option<String> {
              already handles ellipsis behavior. Use `truncate` instead."
                 .into(),
         ),
-        "font-sans" | "font-mono" | "font-serif" => Some(
-            "font-family utilities are not in the v0.1 Typography section. \
-             Set font-family at the gpui app/theme level — it's usually a \
-             one-time configuration, not a per-element class. See #19 for \
-             the design discussion."
+        "font-mono" | "font-serif" => Some(
+            "font-family utilities are not lowered in v0.1 — font-family \
+             lives at the gpui app/Theme level, not per-element. \
+             `font-sans` is accepted as a recognized no-op (#19) for \
+             Tailwind preview compatibility; `font-mono`/`font-serif` \
+             are not currently exempt. Configure the host app's font \
+             stack instead."
                 .into(),
         ),
         _ => None,
@@ -990,7 +1034,37 @@ fn hint_for(raw: &str) -> Option<String> {
             }
         }
     }
+
+    // Custom-scale sizing tokens (e.g. `max-w-200`, `max-w-card`) — the
+    // v0.1 spacing scale is fixed at {0..=12, 16, 20, 24, 32}, with
+    // `max-w-128` exempted as the single app-shell compatibility token
+    // (#19). Anything else under these prefixes that didn't match the
+    // numeric scale gets a hint pointing at the v0.2 manifest direction.
+    for prefix in ["max-w-", "max-h-", "min-w-", "min-h-"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            if !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Some(format!(
+                    "custom sizing tokens (`{prefix}<custom>`) require the v0.2 \
+                     theme manifest. Use the v0.1 spacing scale ({prefix}N for \
+                     N ∈ {{0..=12, 16, 20, 24, 32}}) — `max-w-128` is the only \
+                     app-shell compatibility exemption (see #19)."
+                ));
+            }
+        }
+    }
+
     None
+}
+
+/// Recognized no-op classes — accepted for Tailwind preview compatibility
+/// (so callers don't get UnknownClass) but lower to no GPUI builder call.
+/// v0.1 currently exempts only `font-sans`. See #19.
+fn is_noop_class(raw: &str) -> bool {
+    matches!(raw, "font-sans")
 }
 
 #[cfg(test)]
@@ -1377,25 +1451,16 @@ mod tests {
     fn out_of_spec_sizing_is_unknown() {
         // Each of these is something a Tailwind user would expect to
         // work but the v0.1 Size section doesn't list:
-        //   - w-screen / h-screen: viewport keywords (gpui has w_screen,
-        //     spec just doesn't enumerate it yet)
-        //   - max-w-128: tailwind-config-extended scale (custom token)
         //   - w-1/4 / w-2/4 / w-1/5: fractions outside the four the
         //     spec lists
         //   - w-13: contiguous-range gap
         //   - w-99: well past every allowed step
         //   - w-foo: non-numeric, non-keyword
-        for raw in [
-            "w-screen",
-            "h-screen",
-            "max-w-128",
-            "w-1/4",
-            "w-2/4",
-            "w-1/5",
-            "w-13",
-            "w-99",
-            "w-foo",
-        ] {
+        //
+        // (`w-screen`, `h-screen`, `max-w-128` were here pre-#19 — they
+        // now accept. See `lower_w_screen_and_h_screen` and
+        // `lower_max_w_128_app_shell_compat` below.)
+        for raw in ["w-1/4", "w-2/4", "w-1/5", "w-13", "w-99", "w-foo"] {
             let err = lower_classes(&[tok(raw)]).unwrap_err();
             assert!(
                 matches!(err, Error::UnknownClass { .. }),
@@ -1524,10 +1589,14 @@ mod tests {
     }
 
     #[test]
-    fn font_family_utilities_are_rejected_with_hint() {
-        // Per #19: font-family is host-app concern, not gpuiHTML's. Reject
-        // with a hint pointing at that issue so the diagnostic is actionable.
-        for raw in ["font-sans", "font-mono", "font-serif"] {
+    fn font_mono_and_font_serif_still_reject_with_hint() {
+        // After #19, `font-sans` is a recognized no-op (see
+        // `accept_font_sans_as_noop` below) but `font-mono` and
+        // `font-serif` remain rejected: the host's font stack is one
+        // font-family at a time, set on the gpui app/Theme rather
+        // than per-element. Hint mentions `font-sans` is the only
+        // accepted font-family class for compatibility.
+        for raw in ["font-mono", "font-serif"] {
             let err = lower_classes(&[tok(raw)]).unwrap_err();
             match err {
                 Error::UnknownClass { class, hint, .. } => {
@@ -2315,5 +2384,105 @@ mod tests {
             out.contains("text_color(theme.accent_foreground)"),
             "CSS theme-var normalization diverged from utility, got: {out}"
         );
+    }
+
+    // ---------- issue #19: app-shell utilities ---------------------------
+
+    #[test]
+    fn lower_w_screen_and_h_screen() {
+        // Viewport keywords (#19). gpui's `Styled` exposes
+        // `w_screen()` / `h_screen()` directly.
+        assert_eq!(
+            lowered_method_names(&["w-screen", "h-screen"]),
+            vec!["w_screen", "h_screen"],
+        );
+    }
+
+    #[test]
+    fn lower_size_screen_keyword() {
+        // Symmetry with `size-full`: same shape, viewport variant.
+        assert_eq!(lowered_method_names(&["size-screen"]), vec!["size_screen"],);
+    }
+
+    #[test]
+    fn lower_max_w_128_app_shell_compat() {
+        // The Ato Desktop preview's Tailwind config defines
+        // `maxWidth: { '128': '32rem' }`. v0.1 doesn't ship a generic
+        // custom-scale manifest, but exempts this single token so the
+        // #9 acceptance fixture compiles end-to-end.
+        let calls = lowered_calls("max-w-128");
+        assert_eq!(calls, vec![MethodCall::unary("max_w", "rems(32.0)".into())]);
+    }
+
+    #[test]
+    fn reject_other_custom_max_w_tokens_with_hint() {
+        // Anything other than the explicit `max-w-128` exemption must
+        // still reject, with a hint pointing at the v0.2 manifest path.
+        for raw in ["max-w-200", "max-w-card", "max-w-129", "max-h-card"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            match err {
+                Error::UnknownClass { class, hint, .. } => {
+                    assert_eq!(class, raw);
+                    let hint = hint.unwrap_or_default();
+                    assert!(
+                        hint.contains("manifest"),
+                        "expected v0.2 manifest hint for `{raw}`, got: {hint}"
+                    );
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn accept_font_sans_as_noop() {
+        // `font-sans` is recognized for Tailwind preview compatibility
+        // but emits no MethodCall. The class doesn't error; the call
+        // chain is empty.
+        let calls = lower_classes(&[tok("font-sans")]).unwrap();
+        assert!(
+            calls.is_empty(),
+            "font-sans must lower to no MethodCall, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn font_sans_does_not_reorder_or_block_other_classes() {
+        // Mixed with real utilities, font-sans's source position is
+        // honored by the iteration but it doesn't appear in the output
+        // — the other utilities lower in their normal order. Each
+        // arrangement (front, middle, end) must produce the same two
+        // calls in the same order.
+        let expected = vec![
+            MethodCall::nullary("flex"),
+            MethodCall::unary("text_color", "theme.primary".into()),
+        ];
+        for arrangement in [
+            ["font-sans", "flex", "text-primary"],
+            ["flex", "font-sans", "text-primary"],
+            ["flex", "text-primary", "font-sans"],
+        ] {
+            let toks: Vec<ClassToken> = arrangement.iter().copied().map(tok).collect();
+            assert_eq!(
+                lower_classes(&toks).unwrap(),
+                expected,
+                "font-sans changed the lowered output for {arrangement:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn full_preview_remaining_app_shell_classes_no_longer_unknown() {
+        // The four classes the FULL Ato Desktop preview fixture had
+        // outstanding before #19: w-screen, h-screen, max-w-128,
+        // font-sans. Each must lower (or no-op) without surfacing
+        // UnknownClass — that's the #9 acceptance criterion.
+        for raw in ["w-screen", "h-screen", "max-w-128", "font-sans"] {
+            let result = lower_classes(&[tok(raw)]);
+            assert!(
+                result.is_ok(),
+                "fixture-blocking class `{raw}` should no longer error, got {result:?}"
+            );
+        }
     }
 }
