@@ -1,7 +1,9 @@
 <!--
   gpuiHTML example: a minimal "hello world" panel.
 
-  Expected codegen (target output of `gpui-html examples/hello.html`):
+  Expected codegen (target output of `gpui-html compile examples/hello.html`).
+  v0.1 emits a single dense expression on one line; rustfmt is the user's
+  responsibility. Reformatted for readability:
 
       div()
           .flex()
@@ -9,12 +11,15 @@
           .gap_2()
           .p_4()
           .bg(theme.surface)
-          .child("Hello, gpui!")
+          .child(span().child("Hello, gpui!"))
           .child(
               div()
                   .text_color(theme.muted)
                   .child("Compiled from HTML."),
           )
+
+  Note: <span>x</span> lowers to span().child("x") (not bare "x") so the
+  gpui span element survives the round-trip.
 -->
 <div class="flex flex-col gap-2 p-4 bg-surface">
   <span>Hello, gpui!</span>
