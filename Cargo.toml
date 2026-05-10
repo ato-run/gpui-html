@@ -16,3 +16,5 @@ authors = ["ato-run"]
 
 [workspace.dependencies]
 gpui-html-core = { path = "crates/gpui-html-core", version = "0.0.0" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1.0"
