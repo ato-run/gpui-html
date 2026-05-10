@@ -5,10 +5,10 @@
 //! The crate is split into three stages so each can be replaced independently:
 //!
 //! 1. [`parse`] — gpuiHTML (an HTML subset) into an `ast::Node` tree.
-//! 2. [`ast`]   — the intermediate representation: tag, attrs, children, with
-//!                class names already split into utility tokens.
+//! 2. [`ast`] — the intermediate representation: tag, attrs, children, with
+//!    class names already split into utility tokens.
 //! 3. [`codegen`] — emit gpui builder calls (`div().flex().child(...)`) as a
-//!                  `String` of Rust source.
+//!    `String` of Rust source.
 //!
 //! Stage boundaries are deliberately narrow so a future proc-macro frontend
 //! can reuse stages 2 and 3 without touching the HTML parser, and a future

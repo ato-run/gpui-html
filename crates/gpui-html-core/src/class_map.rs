@@ -1,15 +1,45 @@
 //! Class lowering (stage 2.5): `ClassToken` -> `MethodCall` IR.
 //!
-//! v0.1 vertical-slice scope (kept deliberately narrow so the end-to-end
-//! pipeline can be exercised before fleshing out the full spec table):
+//! Currently lowered (growing toward the full spec table at
+//! `docs/spec.md` § "class 対応範囲"):
 //!
 //! ```text
-//! flex            -> .flex()
-//! flex-col        -> .flex_col()
-//! gap-N           -> .gap_N()         for N in 0..=12
-//! p-N             -> .p_N()           for N in 0..=12
-//! bg-<token>      -> .bg(theme.<token>)
-//! text-<token>    -> .text_color(theme.<token>)
+//! Flex direction:
+//!   flex            -> .flex()
+//!   flex-row        -> .flex_row()
+//!   flex-col        -> .flex_col()
+//!   flex-wrap       -> .flex_wrap()
+//!   flex-nowrap     -> .flex_nowrap()
+//!
+//! Flex sizing:
+//!   flex-1          -> .flex_1()
+//!   flex-auto       -> .flex_auto()
+//!   flex-none       -> .flex_none()
+//!   grow            -> .flex_grow()
+//!   shrink          -> .flex_shrink()
+//!   shrink-0        -> .flex_shrink_0()
+//!
+//! Cross-axis alignment:
+//!   items-start     -> .items_start()
+//!   items-center    -> .items_center()
+//!   items-end       -> .items_end()
+//!   items-baseline  -> .items_baseline()
+//!
+//! Main-axis justification:
+//!   justify-start   -> .justify_start()
+//!   justify-center  -> .justify_center()
+//!   justify-end     -> .justify_end()
+//!   justify-between -> .justify_between()
+//!   justify-around  -> .justify_around()
+//!   justify-evenly  -> .justify_evenly()
+//!
+//! Spacing:
+//!   gap-N           -> .gap_N()         for N in 0..=12
+//!   p-N             -> .p_N()           for N in 0..=12
+//!
+//! Color (symbolic theme tokens):
+//!   bg-<token>      -> .bg(theme.<token>)
+//!   text-<token>    -> .text_color(theme.<token>)
 //! ```
 //!
 //! Anything else surfaces as [`Error::UnknownClass`] with the offending
@@ -59,10 +89,25 @@ pub fn lower_classes(classes: &[ClassToken]) -> Result<Vec<MethodCall>, Error> {
 
 fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     let raw = tok.raw.as_str();
-    match raw {
-        "flex" => return Ok(MethodCall::nullary("flex")),
-        "flex-col" => return Ok(MethodCall::nullary("flex_col")),
-        _ => {}
+
+    // Spec line 179-181: inline-flex and items-stretch are explicitly out
+    // of scope (no matching `Styled` shorthand). Reject with a hint that
+    // points back at the spec rationale so the diagnostic is actionable.
+    if raw == "inline-flex" || raw == "items-stretch" {
+        return Err(Error::UnknownClass {
+            class: raw.to_string(),
+            span: tok.span,
+            hint: Some(
+                "no matching `Styled` shorthand in gpui — \
+                 spec rejects this; use Style.display / Style.align_items \
+                 directly in Rust if you really need it."
+                    .into(),
+            ),
+        });
+    }
+
+    if let Some(call) = lower_layout_keyword(raw) {
+        return Ok(call);
     }
 
     if let Some(rest) = raw.strip_prefix("gap-") {
@@ -104,6 +149,50 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         span: tok.span,
         hint: hint_for(raw),
     })
+}
+
+/// Map a Tailwind layout keyword (no prefix-and-value structure — flat
+/// identity mapping) to its gpui builder method. Returns `None` if the
+/// raw token isn't one of the layout keywords this PR covers; the caller
+/// then falls through to prefix-based lowering (gap-, p-, bg-, text-).
+///
+/// Centralising the table here means adding a new utility is a one-line
+/// match arm and the doc comment at the top of the module stays the
+/// single source of truth for what's lowered.
+fn lower_layout_keyword(raw: &str) -> Option<MethodCall> {
+    let method = match raw {
+        // Flex direction
+        "flex" => "flex",
+        "flex-row" => "flex_row",
+        "flex-col" => "flex_col",
+        "flex-wrap" => "flex_wrap",
+        "flex-nowrap" => "flex_nowrap",
+
+        // Flex sizing
+        "flex-1" => "flex_1",
+        "flex-auto" => "flex_auto",
+        "flex-none" => "flex_none",
+        "grow" => "flex_grow",
+        "shrink" => "flex_shrink",
+        "shrink-0" => "flex_shrink_0",
+
+        // Cross-axis alignment
+        "items-start" => "items_start",
+        "items-center" => "items_center",
+        "items-end" => "items_end",
+        "items-baseline" => "items_baseline",
+
+        // Main-axis justification
+        "justify-start" => "justify_start",
+        "justify-center" => "justify_center",
+        "justify-end" => "justify_end",
+        "justify-between" => "justify_between",
+        "justify-around" => "justify_around",
+        "justify-evenly" => "justify_evenly",
+
+        _ => return None,
+    };
+    Some(MethodCall::nullary(method))
 }
 
 /// v0.1 spacing scale: 0..=12 inclusive. The gpui `Styled` trait exposes
@@ -169,7 +258,10 @@ mod tests {
     #[test]
     fn lower_flex_and_flex_col() {
         let out = lower_classes(&[tok("flex"), tok("flex-col")]).unwrap();
-        assert_eq!(out, vec![MethodCall::nullary("flex"), MethodCall::nullary("flex_col")]);
+        assert_eq!(
+            out,
+            vec![MethodCall::nullary("flex"), MethodCall::nullary("flex_col")]
+        );
     }
 
     #[test]
@@ -203,10 +295,7 @@ mod tests {
     #[test]
     fn bg_theme_token_passthrough() {
         let out = lower_classes(&[tok("bg-surface")]).unwrap();
-        assert_eq!(
-            out,
-            vec![MethodCall::unary("bg", "theme.surface".into())]
-        );
+        assert_eq!(out, vec![MethodCall::unary("bg", "theme.surface".into())]);
     }
 
     #[test]
@@ -269,5 +358,125 @@ mod tests {
         // theme tokens are restricted to identifier shape.
         let err = lower_classes(&[tok("bg-some-color")]).unwrap_err();
         assert!(matches!(err, Error::UnknownClass { .. }));
+    }
+
+    // ---------- issue #11: layout completion ------------------------------
+
+    fn lowered_method_names(classes: &[&str]) -> Vec<String> {
+        let toks: Vec<ClassToken> = classes.iter().copied().map(tok).collect();
+        let calls = lower_classes(&toks).expect("layout classes should lower cleanly");
+        // Layout utilities are all nullary; the test asserts that and
+        // collects the method names so the assertion at the call site
+        // reads as one flat list.
+        calls
+            .into_iter()
+            .map(|c| {
+                assert!(
+                    c.args.is_empty(),
+                    "layout utility unexpectedly emitted args: {:?}",
+                    c
+                );
+                c.name
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lower_flex_direction_utilities() {
+        assert_eq!(
+            lowered_method_names(&["flex", "flex-row", "flex-col", "flex-wrap", "flex-nowrap"]),
+            vec!["flex", "flex_row", "flex_col", "flex_wrap", "flex_nowrap"],
+        );
+    }
+
+    #[test]
+    fn lower_flex_sizing_utilities() {
+        assert_eq!(
+            lowered_method_names(&[
+                "flex-1",
+                "flex-auto",
+                "flex-none",
+                "grow",
+                "shrink",
+                "shrink-0",
+            ]),
+            vec![
+                "flex_1",
+                "flex_auto",
+                "flex_none",
+                "flex_grow",
+                "flex_shrink",
+                "flex_shrink_0",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_items_alignment_utilities() {
+        assert_eq!(
+            lowered_method_names(&["items-start", "items-center", "items-end", "items-baseline"]),
+            vec!["items_start", "items_center", "items_end", "items_baseline",],
+        );
+    }
+
+    #[test]
+    fn lower_justify_utilities() {
+        assert_eq!(
+            lowered_method_names(&[
+                "justify-start",
+                "justify-center",
+                "justify-end",
+                "justify-between",
+                "justify-around",
+                "justify-evenly",
+            ]),
+            vec![
+                "justify_start",
+                "justify_center",
+                "justify_end",
+                "justify_between",
+                "justify_around",
+                "justify_evenly",
+            ],
+        );
+    }
+
+    #[test]
+    fn unknown_layout_like_class_still_errors() {
+        // Spec line 181: items-stretch has no `Styled` shorthand. Must
+        // surface as UnknownClass with a hint and the original token's
+        // span — otherwise diagnostics regress.
+        let t = ClassToken {
+            raw: "items-stretch".into(),
+            span: Span::new(7, 20),
+        };
+        let err = lower_classes(&[t]).unwrap_err();
+        match err {
+            Error::UnknownClass { class, span, hint } => {
+                assert_eq!(class, "items-stretch");
+                assert_eq!(span, Span::new(7, 20), "span must round-trip exactly");
+                assert!(hint.is_some(), "rejected layout class must carry a hint");
+            }
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+
+        // `justify-normal` doesn't exist in any spec section — must remain
+        // UnknownClass without a hint (no specific guidance to give).
+        let err = lower_classes(&[tok("justify-normal")]).unwrap_err();
+        match err {
+            Error::UnknownClass { class, .. } => assert_eq!(class, "justify-normal"),
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_classes_preserve_source_order() {
+        // Builder method order matters: later calls override earlier ones
+        // for conflicting Style fields (gpui builder semantics). The
+        // lowering must not reorder.
+        assert_eq!(
+            lowered_method_names(&["justify-center", "items-center", "flex-1", "flex-col"]),
+            vec!["justify_center", "items_center", "flex_1", "flex_col"],
+        );
     }
 }
