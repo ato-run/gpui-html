@@ -17,6 +17,7 @@
 pub mod ast;
 pub mod class_map;
 pub mod codegen;
+pub mod css;
 pub mod diagnostic;
 pub mod parse;
 
@@ -59,6 +60,11 @@ pub enum Error {
         raw: String,
         span: Span,
     },
+    /// CSS-side error from the static stylesheet pipeline. Spans are
+    /// translated to absolute offsets in the original document by the
+    /// CSS parser, so consumers don't need to know the source was
+    /// embedded inside a `<style>` block.
+    Css(CssError),
     Codegen(CodegenError),
 }
 
@@ -97,6 +103,34 @@ pub struct CodegenError {
     pub message: String,
 }
 
+/// CSS-side error. Modelled after [`ParseError`] (kind + span +
+/// message) so the diagnostic schema is uniform regardless of which
+/// stage raised the error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CssError {
+    pub kind: CssErrorKind,
+    pub span: Span,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CssErrorKind {
+    /// Selector has the right outer shape (starts with `.`) but uses
+    /// pseudo-classes / combinators / compound selectors etc. that
+    /// v0.1 doesn't support.
+    UnsupportedSelector { selector: String },
+    /// Generic syntax error inside a rule (missing `{`, missing `}`,
+    /// stray characters between rules).
+    MalformedRule,
+    /// `property: value` syntax broken (no `:`, no terminator).
+    MalformedDeclaration,
+    /// Property name is valid CSS but v0.1 doesn't lower it.
+    UnsupportedDeclaration { property: String },
+    /// Property is supported but the value isn't (e.g. `padding: 1.7rem`
+    /// — not on the v0.1 spacing scale).
+    UnsupportedValue { property: String, value: String },
+}
+
 impl Error {
     pub fn span(&self) -> Span {
         match self {
@@ -107,6 +141,7 @@ impl Error {
             Error::UnknownThemeToken { span, .. } => *span,
             Error::InvalidEventHandler { span, .. } => *span,
             Error::InvalidInterpolation { span, .. } => *span,
+            Error::Css(e) => e.span,
             Error::Codegen(e) => e.span,
         }
     }
@@ -120,6 +155,13 @@ impl Error {
             Error::UnknownThemeToken { .. } => "UnknownThemeToken",
             Error::InvalidEventHandler { .. } => "InvalidEventHandler",
             Error::InvalidInterpolation { .. } => "InvalidInterpolation",
+            Error::Css(e) => match &e.kind {
+                CssErrorKind::UnsupportedSelector { .. } => "UnsupportedSelector",
+                CssErrorKind::MalformedRule => "MalformedCssRule",
+                CssErrorKind::MalformedDeclaration => "MalformedCssDeclaration",
+                CssErrorKind::UnsupportedDeclaration { .. } => "UnsupportedCssDeclaration",
+                CssErrorKind::UnsupportedValue { .. } => "UnsupportedCssValue",
+            },
             Error::Codegen(_) => "Codegen",
         }
     }
@@ -137,6 +179,12 @@ impl Error {
             Error::UnknownThemeToken { token, .. } => token,
             Error::InvalidEventHandler { name, .. } => name,
             Error::InvalidInterpolation { raw, .. } => raw,
+            Error::Css(e) => match &e.kind {
+                CssErrorKind::UnsupportedSelector { selector } => selector,
+                CssErrorKind::UnsupportedDeclaration { property } => property,
+                CssErrorKind::UnsupportedValue { value, .. } => value,
+                _ => &e.message,
+            },
             Error::Codegen(e) => &e.message,
         }
     }
@@ -165,6 +213,7 @@ impl Error {
             Error::InvalidInterpolation { raw, .. } => {
                 format!("invalid interpolation `{raw}`")
             }
+            Error::Css(e) => e.message.clone(),
             Error::Codegen(e) => e.message.clone(),
         }
     }
@@ -179,6 +228,12 @@ impl From<ParseError> for Error {
 impl From<CodegenError> for Error {
     fn from(e: CodegenError) -> Self {
         Error::Codegen(e)
+    }
+}
+
+impl From<CssError> for Error {
+    fn from(e: CssError) -> Self {
+        Error::Css(e)
     }
 }
 

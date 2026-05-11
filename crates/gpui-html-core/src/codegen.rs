@@ -19,17 +19,26 @@
 //!   so the gpui span element survives the round-trip
 
 use crate::ast::{Element, Node, TextNode};
-use crate::class_map::{lower_classes, MethodCall};
-use crate::{CodegenError, Error, Span};
+use crate::class_map::{lower_classes_with_styles, MethodCall, StyleMap};
+use crate::{css, CodegenError, Error, Span};
 
 /// Compile a parsed node tree into gpui builder Rust source.
 ///
 /// `Node::Style` entries are filtered out before applying the
 /// "exactly one root" rule — they're metadata for the static-CSS
-/// lowering pipeline (#27), not UI nodes. The same filter applies
-/// inside element children so a nested `<style>` doesn't produce an
-/// empty `.child()` call.
+/// lowering pipeline. Their CSS bodies are parsed (#27) into a
+/// combined `StyleMap` that's threaded through element lowering, so
+/// rules in `<style>` apply alongside utility classes from `class=`.
+/// The same filter applies inside element children so a nested
+/// `<style>` doesn't produce an empty `.child()` call.
 pub fn emit(nodes: &[Node]) -> Result<String, Error> {
+    // Collect every `<style>` node anywhere in the AST, parse and
+    // lower its CSS, and merge into one map. Same class appearing in
+    // multiple stylesheets (or repeated within one) gets all rules
+    // appended in source order — the lowering layer already keeps
+    // declaration source order within each rule.
+    let style_map = collect_style_map(nodes)?;
+
     let ui_nodes: Vec<&Node> = nodes.iter().filter(|n| !is_metadata(n)).collect();
 
     if ui_nodes.is_empty() {
@@ -56,7 +65,7 @@ pub fn emit(nodes: &[Node]) -> Result<String, Error> {
     match ui_nodes[0] {
         Node::Element(e) => {
             let mut out = String::new();
-            emit_element(e, &mut out)?;
+            emit_element(e, &style_map, &mut out)?;
             Ok(out)
         }
         Node::Text(t) => Err(Error::Codegen(CodegenError {
@@ -64,6 +73,37 @@ pub fn emit(nodes: &[Node]) -> Result<String, Error> {
             message: "top-level text is not allowed — wrap content in a single root element".into(),
         })),
         Node::Style(_) => unreachable!("filtered out by is_metadata above"),
+    }
+}
+
+/// Walk the node tree (including element subtrees) collecting every
+/// `<style>` block, parse each, and merge the lowerings into a single
+/// `StyleMap`. Same class appearing across multiple stylesheets gets
+/// all rule MethodCalls in document order.
+fn collect_style_map(nodes: &[Node]) -> Result<StyleMap, Error> {
+    let mut map = StyleMap::new();
+    for node in nodes {
+        collect_style_map_node(node, &mut map)?;
+    }
+    Ok(map)
+}
+
+fn collect_style_map_node(node: &Node, map: &mut StyleMap) -> Result<(), Error> {
+    match node {
+        Node::Style(style) => {
+            let local = css::parse_and_lower(&style.css, style.content_start)?;
+            for (class, calls) in local {
+                map.entry(class).or_default().extend(calls);
+            }
+            Ok(())
+        }
+        Node::Element(el) => {
+            for child in &el.children {
+                collect_style_map_node(child, map)?;
+            }
+            Ok(())
+        }
+        Node::Text(_) => Ok(()),
     }
 }
 
@@ -75,9 +115,9 @@ fn is_metadata(node: &Node) -> bool {
     matches!(node, Node::Style(_))
 }
 
-fn emit_node(node: &Node, out: &mut String) -> Result<(), Error> {
+fn emit_node(node: &Node, style_map: &StyleMap, out: &mut String) -> Result<(), Error> {
     match node {
-        Node::Element(e) => emit_element(e, out),
+        Node::Element(e) => emit_element(e, style_map, out),
         Node::Text(t) => {
             emit_text_literal(t, out);
             Ok(())
@@ -88,11 +128,11 @@ fn emit_node(node: &Node, out: &mut String) -> Result<(), Error> {
     }
 }
 
-fn emit_element(el: &Element, out: &mut String) -> Result<(), Error> {
+fn emit_element(el: &Element, style_map: &StyleMap, out: &mut String) -> Result<(), Error> {
     out.push_str(&el.tag);
     out.push_str("()");
 
-    let methods = lower_classes(&el.classes)?;
+    let methods = lower_classes_with_styles(&el.classes, style_map)?;
     for m in &methods {
         emit_method_call(m, out);
     }
@@ -116,7 +156,7 @@ fn emit_element(el: &Element, out: &mut String) -> Result<(), Error> {
 
     for child in el.children.iter().filter(|c| !is_metadata(c)) {
         out.push_str(".child(");
-        emit_node(child, out)?;
+        emit_node(child, style_map, out)?;
         out.push(')');
     }
 
@@ -267,17 +307,18 @@ mod tests {
 
     #[test]
     fn compile_full_html_with_head_style_script_ignores_non_ui_nodes() {
-        // <style> survives parse (Node::Style) but is filtered from
-        // root counting and from element children. <script>, <meta>,
-        // <link>, <title> never produce nodes at all. Net effect: the
-        // body's div is the only root.
+        // <style> survives parse (Node::Style), gets parsed for CSS
+        // rules (#27), but its rules don't appear as children — they
+        // bind to elements that carry the matching class. With no
+        // element using `.a`, the rule is parsed and discarded; output
+        // is still just the body's div.
         let src = r#"<!DOCTYPE html>
 <html>
   <head>
     <meta charset="utf-8">
     <link rel="preconnect" href="https://fonts.example/">
     <title>x</title>
-    <style>.a { color: red; }</style>
+    <style>.a { color: var(--theme-primary); }</style>
     <script>console.log("hi");</script>
   </head>
   <body>
@@ -315,7 +356,110 @@ mod tests {
     fn style_node_does_not_appear_as_child() {
         // A `<style>` inside an element body shouldn't produce a
         // `.child()` call — the metadata filter applies to children too.
-        let src = "<div><style>.foo { color: red; }</style><span>hi</span></div>";
+        // (Use a v0.1-valid CSS rule; the test is about the metadata
+        // filter, not the CSS parser.)
+        let src = "<div><style>.foo { color: var(--theme-primary); }</style><span>hi</span></div>";
         assert_eq!(compile(src).unwrap(), r#"div().child(span().child("hi"))"#);
+    }
+
+    // ---------- issue #27: <style> CSS lowering integration ---------------
+
+    #[test]
+    fn compile_full_html_with_style_class_rule() {
+        // The smoke from issue #27: full HTML, a single class rule
+        // applied to a div whose `class=` references that rule.
+        let src = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <style>.shell { display: flex; color: var(--theme-primary); }</style>
+  </head>
+  <body>
+    <div class="shell"></div>
+  </body>
+</html>"#;
+        let out = compile(src).unwrap();
+        // Phase 1 (CSS rule) emits flex + text_color before any utility
+        // would (no utility for `shell` exists).
+        assert_eq!(out, "div().flex().text_color(theme.primary)");
+    }
+
+    #[test]
+    fn utility_class_overrides_style_rule_by_order() {
+        // CSS rule first (Phase 1), utility second (Phase 2). When both
+        // touch the same Style field — gap here — the utility's later
+        // call wins per gpui builder semantics. The test pins the
+        // EMITTED ORDER; semantic override is a property of gpui.
+        let src = r#"<style>.a { gap: 1rem; }</style><div class="a gap-2"></div>"#;
+        let out = compile(src).unwrap();
+        // Source order in class=: "a gap-2".
+        // Phase 1 (CSS for "a"): gap_4
+        // Phase 1 (CSS for "gap-2"): nothing (no rule)
+        // Phase 2 (utility for "a"): nothing (not a utility, but rule
+        //   covered it so no error)
+        // Phase 2 (utility for "gap-2"): gap_2
+        // Final: gap_4 then gap_2 — utility wins.
+        assert_eq!(out, "div().gap_4().gap_2()");
+    }
+
+    #[test]
+    fn multiple_style_blocks_preserve_source_order() {
+        // Two separate <style> blocks, same class .foo. Rules
+        // concatenate in source order: first stylesheet's rule, then
+        // second's, then any utility lowering for "foo" (none here).
+        let src = r#"<html>
+  <head>
+    <style>.foo { padding: 1rem; }</style>
+    <style>.foo { gap: 0.5rem; }</style>
+  </head>
+  <body>
+    <div class="foo"></div>
+  </body>
+</html>"#;
+        assert_eq!(compile(src).unwrap(), "div().p_4().gap_2()");
+    }
+
+    #[test]
+    fn style_rule_without_matching_class_is_silently_unused() {
+        // CSS rule for `.unused` is parsed and lowered but the document
+        // has no element with that class — the lowering simply isn't
+        // emitted. (No warning channel in v0.1; this could become a
+        // soft diagnostic later.)
+        let src = r#"<html>
+  <head><style>.unused { padding: 1rem; }</style></head>
+  <body><div></div></body>
+</html>"#;
+        assert_eq!(compile(src).unwrap(), "div()");
+    }
+
+    #[test]
+    fn class_with_only_a_css_rule_is_not_unknown() {
+        // `.shell` is not a utility class. Pre-#27 this would be
+        // `UnknownClass`. With #27, having a CSS rule for it is enough
+        // — the lowering layer skips Phase 2's utility-lookup error
+        // when the style map has it covered.
+        let src = r#"<style>.shell { display: flex; }</style><div class="shell"></div>"#;
+        assert_eq!(compile(src).unwrap(), "div().flex()");
+    }
+
+    #[test]
+    fn unknown_class_with_no_style_rule_still_errors() {
+        // Sanity check: classes that are NEITHER a known utility NOR
+        // covered by a CSS rule still error (we didn't accidentally
+        // turn the strict UnknownClass into a no-op).
+        let src = r#"<div class="not-a-utility-or-rule"></div>"#;
+        let err = compile(src).unwrap_err();
+        assert!(matches!(err, Error::UnknownClass { .. }));
+    }
+
+    #[test]
+    fn style_node_inside_element_subtree_still_contributes() {
+        // The collector walks element children too — a `<style>` deep
+        // inside the AST should still build the StyleMap.
+        let src = r#"<div class="shell">
+  <style>.shell { display: flex; }</style>
+  <span>hi</span>
+</div>"#;
+        let out = compile(src).unwrap();
+        assert_eq!(out, r#"div().flex().child(span().child("hi"))"#);
     }
 }

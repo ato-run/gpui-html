@@ -480,10 +480,111 @@ $<expr>    → Rust view state / props 参照（`$sessions`, `$secrets.PG_PASSWO
 component の prop は基本的に文字列値か `$<expr>` の二択。配列・オブジェクト
 リテラルは v0.1 では未サポート。
 
-## CSS ファイルは許可しない
+## `<style>` インライン CSS のサブセット対応
 
-通常の CSS は使わない。spacing / radius / shadow scale は spec で固定済み
-（前述の class 表）であり、定義ファイルを必要としない。
+v0.1 spec は full HTML document をそのまま受け取る (issue #26)。HTML
+boilerplate は parse-and-skip し、`<body>` 内の UI subtree だけが
+codegen 対象になる。`<head>` 等に置かれた `<style>...</style>` は
+parse pipeline が AST 上で `Node::Style` として保持し、CSS pipeline
+(issue #27) が以下のサブセットを class lowering に統合する。
+
+外部 CSS ファイル (`<link rel="stylesheet">`) は v0.1 でも非対応。
+fetch しないし、href も無視する。
+
+### v0.1 で受け取る CSS subset
+
+Selector:
+
+```text
+.foo                   → 対応 (class selector のみ)
+.foo-bar / .foo_1      → 対応 (Tailwind 風 hyphenated / underscored)
+```
+
+非対応 (すべて `UnsupportedSelector` 構造化エラー):
+
+```text
+.foo:hover             → pseudo-class
+.foo .bar              → descendant combinator
+.foo > .bar            → child combinator
+.foo, .bar             → selector list
+.foo.bar               → compound selector
+#root                  → id selector
+div, *                 → type / universal selector
+@media, @keyframes     → at-rule
+```
+
+Declaration (property → 既存 `MethodCall` lowering へ流す):
+
+```text
+display: flex / grid / block / none
+flex-direction: row / column
+flex-wrap: wrap / nowrap
+align-items: center / start / end / baseline / flex-start / flex-end
+justify-content: center / start / end / space-between / space-around / space-evenly
+gap / padding[-side] / margin[-side]: <n>rem または <n>px
+                       → spacing scale (#10 と同じ {0..=12, 16, 20, 24, 32})
+width / height: 100% / auto
+                       → .w_full() / .h_full() / .w_auto() / .h_auto()
+color / background-color / border-color: var(--theme-<token>)
+                       → .text_color(theme.<token>) など
+font-weight: thin / light / normal / medium / semibold / bold / extrabold / black
+            または 100 / 300 / 400 / 500 / 600 / 700 / 800 / 900
+overflow / overflow-x / overflow-y: hidden / visible / scroll
+cursor: pointer / default / text
+opacity: 0..=1 (0.5 等)、または 0%..=100%
+```
+
+非対応 declaration は `UnsupportedDeclaration` 構造化エラー、対応
+property の不正値 (e.g. `padding: 1.7rem`) は `UnsupportedValue` で
+spec 上のスケールから外れていることを通知する。
+
+### CSS theme token 参照
+
+CSS 内では theme token を `var(--theme-<token>)` の形で参照する。
+custom property 名は CSS 規格上 hyphen を含めるので、Tailwind utility
+の `text-accent-foreground` (#7 で議論中) のような曖昧さが発生しない。
+hyphen は Rust ident として lowering 時に underscore に正規化される。
+
+```text
+color: var(--theme-primary)              → .text_color(theme.primary)
+color: var(--theme-accent-foreground)    → .text_color(theme.accent_foreground)
+background-color: var(--theme-surface)   → .bg(theme.surface)
+```
+
+直接色指定 (`color: red`, `color: #fff`, `color: rgb(...)`) は v0.1 では
+すべて `UnsupportedValue` として reject される。理由は Ato Desktop の
+theme / dark mode / accessibility を壊さないため。
+
+### 統合順序: utility class が CSS rule を上書きする
+
+`class="foo bar"` で要素が両方の class を持ち、`<style>.foo { ... }`
+で `.foo` のルールも定義されているとき、emitted method order は次のとおり:
+
+1. **Phase 1** (CSS rule): class 出現順に、CSS rule の `MethodCall` 列を
+   出力する。
+2. **Phase 2** (utility class): 同じく class 出現順に、utility class
+   lowering を出力する。Phase 1 で CSS rule にカバーされた class が
+   utility table に存在しなくても `UnknownClass` にしない。
+
+意味的には GPUI builder semantics により後勝ちになるため、**utility
+class が CSS rule を override する**。`class="..."` は局所オーバーライド
+として読みやすい、というユーザ視点での原則。
+
+### 統合の Definition of Done
+
+- `<style>...</style>` 内の class rule が、対応 element の `class=`
+  属性と突き合わされて lowering される。
+- 同じ class が複数 stylesheet または同一 stylesheet で複数回現れた
+  場合は source order で MethodCall 列を結合する。
+- 非対応 selector / declaration / value は span 付き構造化エラーとして
+  通知される (silent drop しない)。
+- 元 HTML 全体に対する absolute span として出力される (parser 内部の
+  局所 offset は外に漏らさない)。
+
+## 旧 "CSS ファイルは許可しない" セクション (補足)
+
+通常の外部 CSS ファイルは使わない。spacing / radius / shadow scale は
+spec で固定済み (前述の class 表) であり、定義ファイルを必要としない。
 
 色だけは固定スケールに乗らないため、**theme token** という概念で扱う。
 

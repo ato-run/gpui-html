@@ -137,8 +137,18 @@
 //! that's deferred to rustc when the generated code is compiled. This is
 //! the v0.1 contract; v0.2 will validate against a manifest.
 
+use std::collections::HashMap;
+
 use crate::ast::ClassToken;
 use crate::Error;
+
+/// `class name -> ordered MethodCalls from <style> rules`. Built by
+/// the CSS pipeline (`crate::css::parse_and_lower`) and threaded
+/// through codegen so element-level lowering can apply both utility
+/// classes and stylesheet rules in one pass. An empty map is
+/// equivalent to "no `<style>` blocks present" — that's the path
+/// taken by callers that don't go through the document parser.
+pub type StyleMap = HashMap<String, Vec<MethodCall>>;
 
 /// One method call in the emitted gpui builder chain, e.g. `.gap_2()` or
 /// `.bg(theme.surface)`. Args are stored as already-formatted Rust source
@@ -150,14 +160,14 @@ pub struct MethodCall {
 }
 
 impl MethodCall {
-    fn nullary(name: &str) -> Self {
+    pub(crate) fn nullary(name: &str) -> Self {
         MethodCall {
             name: name.to_string(),
             args: vec![],
         }
     }
 
-    fn unary(name: &str, arg: String) -> Self {
+    pub(crate) fn unary(name: &str, arg: String) -> Self {
         MethodCall {
             name: name.to_string(),
             args: vec![arg],
@@ -169,8 +179,58 @@ impl MethodCall {
 /// codegen will splice. Order is preserved so authors can rely on the
 /// left-to-right precedence of gpui's builder (later calls override
 /// earlier ones for conflicting Style fields).
+///
+/// Equivalent to [`lower_classes_with_styles`] called with an empty
+/// `StyleMap` — i.e. no `<style>` rules in the document, only utility
+/// classes.
 pub fn lower_classes(classes: &[ClassToken]) -> Result<Vec<MethodCall>, Error> {
-    classes.iter().map(lower_one).collect()
+    lower_classes_with_styles(classes, &StyleMap::new())
+}
+
+/// Lower utility classes *and* `<style>` rule bindings in one pass.
+///
+/// **Order contract** (pinned by tests; see PR #27 for the rationale):
+///
+///   1. **Phase 1 — CSS rules**: for each class in source order, if the
+///      stylesheet defined a rule for it, emit that rule's MethodCalls.
+///   2. **Phase 2 — utility classes**: for each class in source order,
+///      emit the utility lowering (`flex`, `gap-2`, …). Classes that
+///      have a stylesheet rule but aren't a known utility are skipped
+///      here rather than producing `UnknownClass` — Phase 1 already
+///      handled them.
+///
+/// The net effect is "**utility class wins over stylesheet rule** when
+/// both touch the same Style field" — gpui builder semantics make the
+/// later `.gap_2()` override an earlier `.gap_4()` from a CSS rule.
+/// The user-facing rationale is that `class="..."` reads as a local
+/// override of any rule the class might also have in `<style>`.
+pub fn lower_classes_with_styles(
+    classes: &[ClassToken],
+    style_map: &StyleMap,
+) -> Result<Vec<MethodCall>, Error> {
+    let mut result: Vec<MethodCall> = Vec::new();
+
+    // Phase 1: stylesheet rules.
+    for cls in classes {
+        if let Some(rule_calls) = style_map.get(&cls.raw) {
+            result.extend(rule_calls.iter().cloned());
+        }
+    }
+
+    // Phase 2: utility lowerings. Classes that are unknown utilities
+    // but DO have a stylesheet rule (Phase 1 already handled them)
+    // pass silently here.
+    for cls in classes {
+        match lower_one(cls) {
+            Ok(call) => result.push(call),
+            Err(Error::UnknownClass { .. }) if style_map.contains_key(&cls.raw) => {
+                // Already covered by Phase 1; not really an unknown class.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(result)
 }
 
 fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
