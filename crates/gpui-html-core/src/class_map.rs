@@ -58,6 +58,21 @@
 //!   `UnknownClass` even though gpui's `Styled` trait would support
 //!   them — opening that surface is a v0.2 concern.
 //!
+//! Typography:
+//!   text-xs / sm / base / lg / xl / 2xl / 3xl
+//!                   -> .text_xs() ... .text_3xl()
+//!   font-thin / light / normal / medium / semibold / bold / extrabold / black
+//!                   -> .font_weight(FontWeight::THIN) ... ::BLACK
+//!   italic / not-italic / line-through / truncate
+//!                   -> .italic() / .not_italic() / .line_through() / .truncate()
+//!   leading-none / tight / snug / normal / relaxed / loose
+//!                   -> .line_height(rems(<n>))
+//!   line-clamp-N    -> .line_clamp(N)
+//!
+//!   Rejected with hint: `font-sans` / `font-mono` / `font-serif`
+//!   (font-family is an app-shell concern, see #19), `whitespace-nowrap`,
+//!   `whitespace-normal`, `text-ellipsis` (subsumed by `truncate`).
+//!
 //! Color (symbolic theme tokens):
 //!   bg-<token>      -> .bg(theme.<token>)
 //!   text-<token>    -> .text_color(theme.<token>)
@@ -155,6 +170,23 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         return Ok(call);
     }
 
+    // Typography utilities the spec deliberately rejects (with reasons):
+    // surface a focused hint instead of falling through to a generic
+    // UnknownClass. Has to run *before* `lower_typography` because the
+    // rejected names (`font-sans`, `text-ellipsis`) would otherwise just
+    // miss every match arm and yield a hint-less error.
+    if let Some(hint) = typography_rejection_hint(raw) {
+        return Err(Error::UnknownClass {
+            class: raw.to_string(),
+            span: tok.span,
+            hint: Some(hint),
+        });
+    }
+
+    if let Some(call) = lower_typography(raw) {
+        return Ok(call);
+    }
+
     if let Some(token) = raw.strip_prefix("bg-") {
         if is_theme_token(token) {
             return Ok(MethodCall::unary("bg", format!("theme.{token}")));
@@ -162,16 +194,9 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(token) = raw.strip_prefix("text-") {
-        // Typography size utilities (text-xs..text-3xl) live in a future
-        // milestone; reject them with a hint so callers don't silently
-        // get `theme.xs` lookups.
-        if is_typography_size(token) {
-            return Err(Error::UnknownClass {
-                class: raw.to_string(),
-                span: tok.span,
-                hint: hint_for(raw),
-            });
-        }
+        // text-xs..text-3xl are typography sizes (handled by
+        // `lower_typography` above). Anything else under `text-` is a
+        // color theme token.
         if is_theme_token(token) {
             return Ok(MethodCall::unary("text_color", format!("theme.{token}")));
         }
@@ -344,6 +369,116 @@ fn lower_sizing_keyword(raw: &str) -> Option<MethodCall> {
     Some(MethodCall::nullary(method))
 }
 
+/// Lower a Tailwind typography utility to its gpui builder method.
+/// Covers text size, font weight, decoration, line-height, line-clamp,
+/// and the standalone keywords (`italic`, `truncate`, ...).
+///
+/// `text-<size>` returns here only for the seven sizes the spec lists
+/// (`xs`, `sm`, `base`, `lg`, `xl`, `2xl`, `3xl`); any other `text-…`
+/// shape falls through, so the color theme-token path can claim it
+/// downstream. That ordering is the disambiguation contract:
+/// **typography size wins over theme color** when the suffix collides.
+fn lower_typography(raw: &str) -> Option<MethodCall> {
+    // text-<size> → .text_<size>()
+    if let Some(suffix) = raw.strip_prefix("text-") {
+        if is_typography_size(suffix) {
+            return Some(MethodCall::nullary(&format!("text_{suffix}")));
+        }
+    }
+
+    // font-<weight> → .font_weight(FontWeight::<VARIANT>)
+    if let Some(weight) = font_weight_variant(raw) {
+        return Some(MethodCall::unary(
+            "font_weight",
+            format!("FontWeight::{weight}"),
+        ));
+    }
+
+    // Flat keyword utilities
+    let nullary_method = match raw {
+        "italic" => "italic",
+        "not-italic" => "not_italic",
+        "line-through" => "line_through",
+        "truncate" => "truncate",
+        _ => return lower_typography_argful(raw),
+    };
+    Some(MethodCall::nullary(nullary_method))
+}
+
+/// Tail of `lower_typography` for the utilities that produce a unary
+/// builder call with a non-trivial Rust expression argument
+/// (`leading-*`, `line-clamp-N`). Split out to keep the main function
+/// flat and easy to scan against the spec table.
+fn lower_typography_argful(raw: &str) -> Option<MethodCall> {
+    // leading-<keyword> → .line_height(rems(<n>))
+    let line_height_arg = match raw {
+        "leading-none" => "rems(1.0)",
+        "leading-tight" => "rems(1.25)",
+        "leading-snug" => "rems(1.375)",
+        "leading-normal" => "rems(1.5)",
+        "leading-relaxed" => "rems(1.625)",
+        "leading-loose" => "rems(2.0)",
+        _ => "",
+    };
+    if !line_height_arg.is_empty() {
+        return Some(MethodCall::unary("line_height", line_height_arg.into()));
+    }
+
+    // line-clamp-<n> → .line_clamp(<n>); reject 0 (semantically nonsense)
+    if let Some(rest) = raw.strip_prefix("line-clamp-") {
+        if let Ok(n) = rest.parse::<u32>() {
+            if n > 0 {
+                return Some(MethodCall::unary("line_clamp", n.to_string()));
+            }
+        }
+    }
+
+    None
+}
+
+fn font_weight_variant(raw: &str) -> Option<&'static str> {
+    let variant = match raw {
+        "font-thin" => "THIN",
+        "font-light" => "LIGHT",
+        "font-normal" => "NORMAL",
+        "font-medium" => "MEDIUM",
+        "font-semibold" => "SEMIBOLD",
+        "font-bold" => "BOLD",
+        "font-extrabold" => "EXTRA_BOLD",
+        "font-black" => "BLACK",
+        _ => return None,
+    };
+    Some(variant)
+}
+
+/// Typography classes the spec deliberately rejects (lines 320-329)
+/// plus font-family utilities (deferred per #19). Returning `Some(_)`
+/// short-circuits to a structured `UnknownClass` carrying the hint;
+/// returning `None` lets the rest of the lowering pipeline run.
+fn typography_rejection_hint(raw: &str) -> Option<String> {
+    match raw {
+        "whitespace-nowrap" | "whitespace-normal" => Some(
+            "no `Styled` shorthand for whitespace utilities — write to \
+             `Style.text` directly, or use `truncate` for single-line \
+             truncation."
+                .into(),
+        ),
+        "text-ellipsis" => Some(
+            "no standalone `text_ellipsis()` method in gpui; `truncate` \
+             already handles ellipsis behavior. Use `truncate` instead."
+                .into(),
+        ),
+        "font-sans" | "font-mono" | "font-serif" => Some(
+            "font-family utilities are not in the v0.1 Typography section. \
+             Set font-family at the gpui app/theme level — it's usually a \
+             one-time configuration, not a per-element class. See #19 for \
+             the design discussion."
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
 /// v0.1 spacing scale per `docs/spec.md`: contiguous 0..=12 plus the
 /// jump steps 16, 20, 24, 32. The Border section (spec line 248)
 /// enumerates this set explicitly for `border-<n>`, and the Size
@@ -392,15 +527,6 @@ fn hint_for(raw: &str) -> Option<String> {
              palette utilities like `bg-red-500` are out of scope."
                 .into(),
         );
-    }
-    if let Some(rest) = raw.strip_prefix("text-") {
-        if is_typography_size(rest) {
-            return Some(
-                "typography size utilities are not in the v0.1 vertical slice. \
-                 Use a theme token (e.g. `text-muted`) or wait for full v0.1 typography support."
-                    .into(),
-            );
-        }
     }
     None
 }
@@ -481,17 +607,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn text_typography_utility_is_rejected_with_hint() {
-        let err = lower_classes(&[tok("text-xs")]).unwrap_err();
-        match err {
-            Error::UnknownClass { class, hint, .. } => {
-                assert_eq!(class, "text-xs");
-                assert!(hint.is_some(), "typography utilities should carry a hint");
-            }
-            other => panic!("expected UnknownClass, got {other:?}"),
-        }
-    }
+    // Note: the previous `text_typography_utility_is_rejected_with_hint`
+    // test pinned the v0.1 vertical-slice behavior where `text-xs..3xl`
+    // were rejected with a "deferred" hint. With #13 (this PR's
+    // landing), those *do* lower — see `lower_text_size_utilities`
+    // below. The old test is intentionally removed, not skipped, so the
+    // contract change is explicit in the diff.
 
     #[test]
     fn unknown_class_carries_token_span() {
@@ -840,6 +961,188 @@ mod tests {
         assert_eq!(
             lowered_method_names(&["w-full", "h-full", "min-w-4", "max-w-12"]),
             vec!["w_full", "h_full", "min_w_4", "max_w_12"],
+        );
+    }
+
+    // ---------- issue #13: typography -------------------------------------
+
+    #[test]
+    fn lower_text_size_utilities() {
+        // All seven sizes the spec lists (line 289). `text-base`, `text-2xl`,
+        // `text-3xl` are the easy-to-fumble ones because of the `base` and
+        // digit-prefix suffixes — pin them explicitly.
+        assert_eq!(
+            lowered_method_names(&[
+                "text-xs",
+                "text-sm",
+                "text-base",
+                "text-lg",
+                "text-xl",
+                "text-2xl",
+                "text-3xl",
+            ]),
+            vec![
+                "text_xs",
+                "text_sm",
+                "text_base",
+                "text_lg",
+                "text_xl",
+                "text_2xl",
+                "text_3xl",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_font_weight_utilities_emit_unary_call() {
+        // Font weights expand to .font_weight(FontWeight::<VARIANT>) — the
+        // spec is explicit about this not being a shorthand. Verify both
+        // the method name and the constructed argument.
+        let cases = [
+            ("font-thin", "THIN"),
+            ("font-light", "LIGHT"),
+            ("font-normal", "NORMAL"),
+            ("font-medium", "MEDIUM"),
+            ("font-semibold", "SEMIBOLD"),
+            ("font-bold", "BOLD"),
+            ("font-extrabold", "EXTRA_BOLD"),
+            ("font-black", "BLACK"),
+        ];
+        for (raw, variant) in cases {
+            let calls = lower_classes(&[tok(raw)]).expect("font-weight should lower");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "font_weight");
+            assert_eq!(calls[0].args, vec![format!("FontWeight::{variant}")]);
+        }
+    }
+
+    #[test]
+    fn lower_text_decoration_and_truncate_keywords() {
+        assert_eq!(
+            lowered_method_names(&["italic", "not-italic", "line-through", "truncate"]),
+            vec!["italic", "not_italic", "line_through", "truncate"],
+        );
+    }
+
+    #[test]
+    fn lower_leading_utilities_emit_rems_arg() {
+        // leading-* expand to .line_height(rems(<n>)) — spec line 305-310
+        // pegs the rem values, so this also pins the rem rendering.
+        let cases = [
+            ("leading-none", "rems(1.0)"),
+            ("leading-tight", "rems(1.25)"),
+            ("leading-snug", "rems(1.375)"),
+            ("leading-normal", "rems(1.5)"),
+            ("leading-relaxed", "rems(1.625)"),
+            ("leading-loose", "rems(2.0)"),
+        ];
+        for (raw, expected_arg) in cases {
+            let calls = lower_classes(&[tok(raw)]).expect("leading-* should lower");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "line_height");
+            assert_eq!(calls[0].args, vec![expected_arg.to_string()]);
+        }
+    }
+
+    #[test]
+    fn lower_line_clamp_with_numeric_arg() {
+        // Spec line 312: line-clamp-<n> → .line_clamp(<n>) for any positive n.
+        for n in [1u32, 2, 3, 5, 99] {
+            let raw = format!("line-clamp-{n}");
+            let calls = lower_classes(&[tok(&raw)]).expect("line-clamp should lower");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "line_clamp");
+            assert_eq!(calls[0].args, vec![n.to_string()]);
+        }
+        // Zero is semantically nonsense; non-numeric and negative reject.
+        for raw in ["line-clamp-0", "line-clamp-foo", "line-clamp-"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn font_family_utilities_are_rejected_with_hint() {
+        // Per #19: font-family is host-app concern, not gpuiHTML's. Reject
+        // with a hint pointing at that issue so the diagnostic is actionable.
+        for raw in ["font-sans", "font-mono", "font-serif"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            match err {
+                Error::UnknownClass { class, hint, .. } => {
+                    assert_eq!(class, raw);
+                    let hint = hint.expect("font-family must carry a hint");
+                    assert!(
+                        hint.contains("font-family"),
+                        "hint should mention font-family, got: {hint}"
+                    );
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_and_text_ellipsis_rejected_with_hint() {
+        // Spec lines 322-326 explicitly禁止 these. Reject with a hint
+        // citing the spec's stated alternative (truncate / direct
+        // Style.text manipulation).
+        for raw in ["whitespace-nowrap", "whitespace-normal", "text-ellipsis"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            match err {
+                Error::UnknownClass { hint, .. } => {
+                    assert!(hint.is_some(), "{raw} should carry a hint");
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn typography_size_wins_over_theme_color_disambiguation() {
+        // Disambiguation contract: `text-xs..3xl` are typography sizes,
+        // not theme color tokens. If a theme had a `xs` color field
+        // (silly but legal), `text-xs` still lowers as typography.
+        let calls = lower_classes(&[tok("text-xs")]).unwrap();
+        assert_eq!(calls, vec![MethodCall::nullary("text_xs")]);
+
+        // Conversely, anything outside the seven listed sizes is a
+        // theme color: `text-muted` doesn't accidentally try to lower
+        // as a typography size.
+        let calls = lower_classes(&[tok("text-muted")]).unwrap();
+        assert_eq!(
+            calls,
+            vec![MethodCall::unary("text_color", "theme.muted".into())]
+        );
+    }
+
+    #[test]
+    fn typography_classes_preserve_source_order() {
+        // Mixed typography utilities — sizes, weights, decorations,
+        // leading, clamp — must keep source order through lowering so
+        // the gpui builder chain matches what the author wrote.
+        let calls = lower_classes(&[
+            tok("text-sm"),
+            tok("font-semibold"),
+            tok("italic"),
+            tok("leading-tight"),
+            tok("truncate"),
+            tok("line-clamp-2"),
+        ])
+        .unwrap();
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "text_sm",
+                "font_weight",
+                "italic",
+                "line_height",
+                "truncate",
+                "line_clamp",
+            ]
         );
     }
 }
