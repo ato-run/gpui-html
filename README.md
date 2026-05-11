@@ -80,6 +80,37 @@ Three rules to keep in mind:
 3. **`overflow-auto` does not exist** in gpui — use `overflow-y-scroll`.
    See the spec's "付録 A" for other Tailwind-isms that don't carry over.
 
+## Examples
+
+```sh
+gpui-html compile examples/hello.html
+gpui-html compile examples/ato-desktop-preview.gpui.html
+```
+
+- [`examples/hello.html`](examples/hello.html) — minimal smoke
+  (vertical-slice contract). The pinned compile output is the v0.1
+  vertical slice regression target.
+- [`examples/ato-desktop-preview.gpui.html`](examples/ato-desktop-preview.gpui.html) —
+  **issue #9 acceptance fixture**. The original mock Ato Desktop preview,
+  byte-identical to the input the v0.1 surface was designed around:
+  full HTML document with `<!DOCTYPE>`, `<html>`, `<head>` containing
+  `<meta>` / `<link>` / `<title>` / `<script>` / `<style>`, and the
+  `<body>` UI tree. **Not** Ato Desktop's production UI — a static
+  acceptance target that exercises every category of the v0.1 lowering
+  surface (document compatibility layer, lenient CSS, full utility
+  table, hyphenated theme tokens, app-shell exemptions, no-op classes)
+  in one input. The compiled output is pinned by an integration test
+  (`crates/gpui-html-core/tests/ato_desktop_preview_fixture.rs`)
+  against the snapshot in `examples/ato-desktop-preview.expected.gpui.txt`.
+
+  Browser-only behavior the fixture relies on:
+  - `<script>` content is raw-text-skipped (gpuiHTML never executes JS).
+  - The `<style>` block's browser CSS resets (`*, *::before, *::after`,
+    `html, body { ... }`, `::-webkit-scrollbar`) are silently skipped
+    under lenient mode — none of them have gpui-side equivalents.
+  - Generated output is a single dense expression on one line; rustfmt
+    is the caller's responsibility (see `docs/spec.md`).
+
 ## Crates
 
 - [`gpui-html-core`](crates/gpui-html-core) — parser + IR + codegen library.
