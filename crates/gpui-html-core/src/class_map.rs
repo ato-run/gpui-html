@@ -45,6 +45,19 @@
 //!
 //!   Negative margins (`-m-N`, `-mx-N`, ...) are禁止 in v0.1 (spec line 219).
 //!
+//! Size (numeric variants share the spacing scale; keywords/fractions
+//! are flat identity maps):
+//!   w-N / h-N / size-N
+//!   min-w-N / min-h-N / max-w-N / max-h-N
+//!   w-full / h-full / size-full
+//!   w-auto / h-auto
+//!   w-1/2 / w-1/3 / w-2/3 / w-3/4   (the four fractions the spec lists)
+//!
+//!   `w-screen` / `h-screen` and Tailwind-config-extended scales like
+//!   `max-w-128` are NOT in the v0.1 Size section and therefore remain
+//!   `UnknownClass` even though gpui's `Styled` trait would support
+//!   them — opening that surface is a v0.2 concern.
+//!
 //! Color (symbolic theme tokens):
 //!   bg-<token>      -> .bg(theme.<token>)
 //!   text-<token>    -> .text_color(theme.<token>)
@@ -135,6 +148,10 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(call) = lower_spacing(raw) {
+        return Ok(call);
+    }
+
+    if let Some(call) = lower_sizing(raw) {
         return Ok(call);
     }
 
@@ -264,6 +281,67 @@ fn lower_spacing(raw: &str) -> Option<MethodCall> {
 fn is_negative_margin(raw: &str) -> bool {
     const NEG_MARGIN_PREFIXES: &[&str] = &["-m-", "-mx-", "-my-", "-mt-", "-mr-", "-mb-", "-ml-"];
     NEG_MARGIN_PREFIXES.iter().any(|p| raw.starts_with(p))
+}
+
+/// Lower a Tailwind sizing utility (width / height / size, with optional
+/// min/max prefix) to the matching gpui builder method. Tries the flat
+/// keyword/fraction map first (`w-full`, `w-1/2`, etc.) so prefix
+/// matching can't accidentally swallow them, then falls back to the
+/// numeric prefix table.
+///
+/// Out-of-spec numeric prefixes (`max-w-128`) and viewport keywords
+/// (`w-screen` / `h-screen`) are deliberately NOT handled here — see the
+/// module-level doc comment.
+fn lower_sizing(raw: &str) -> Option<MethodCall> {
+    if let Some(call) = lower_sizing_keyword(raw) {
+        return Some(call);
+    }
+
+    // Numeric prefixes — longest-first within each axis so `min-w-` and
+    // `max-w-` are tried before bare `w-`, and `size-` before `s-`-shaped
+    // future prefixes (none exist today; ordering is defensive).
+    const PREFIXES: &[(&str, &str)] = &[
+        ("min-w-", "min_w_"),
+        ("min-h-", "min_h_"),
+        ("max-w-", "max_w_"),
+        ("max-h-", "max_h_"),
+        ("size-", "size_"),
+        ("w-", "w_"),
+        ("h-", "h_"),
+    ];
+    for (prefix, method_prefix) in PREFIXES {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            return parse_spacing_step(rest)
+                .map(|n| MethodCall::nullary(&format!("{method_prefix}{n}")));
+        }
+    }
+    None
+}
+
+/// Flat identity map for the non-numeric sizing utilities the spec
+/// enumerates: `w-full` / `h-full` / `size-full`, `w-auto` / `h-auto`,
+/// and the four fractional widths. Anything else (`w-screen`, `w-1/5`,
+/// `w-1/4`) falls through to `UnknownClass` because the spec doesn't
+/// list it.
+///
+/// Tokenizer note: `w-1/2` arrives here as a single class token because
+/// `split_classes` only splits on whitespace. The `/` is preserved
+/// verbatim, which is what makes the literal match below work — see
+/// `fractional_width_token_survives_tokenizer` below.
+fn lower_sizing_keyword(raw: &str) -> Option<MethodCall> {
+    let method = match raw {
+        "w-full" => "w_full",
+        "h-full" => "h_full",
+        "size-full" => "size_full",
+        "w-auto" => "w_auto",
+        "h-auto" => "h_auto",
+        "w-1/2" => "w_1_2",
+        "w-1/3" => "w_1_3",
+        "w-2/3" => "w_2_3",
+        "w-3/4" => "w_3_4",
+        _ => return None,
+    };
+    Some(MethodCall::nullary(method))
 }
 
 /// v0.1 spacing scale per `docs/spec.md`: contiguous 0..=12 plus the
@@ -658,6 +736,110 @@ mod tests {
         assert_eq!(
             lowered_method_names(&["px-4", "py-2", "mt-1", "gap-3"]),
             vec!["px_4", "py_2", "mt_1", "gap_3"],
+        );
+    }
+
+    // ---------- issue #12: sizing -----------------------------------------
+
+    #[test]
+    fn lower_width_height_size_numeric() {
+        assert_eq!(
+            lowered_method_names(&["w-0", "h-1", "size-2", "w-12", "h-12", "size-12"]),
+            vec!["w_0", "h_1", "size_2", "w_12", "h_12", "size_12"],
+        );
+    }
+
+    #[test]
+    fn lower_min_max_width_height() {
+        assert_eq!(
+            lowered_method_names(&["min-w-2", "min-h-3", "max-w-4", "max-h-5"]),
+            vec!["min_w_2", "min_h_3", "max_w_4", "max_h_5"],
+        );
+    }
+
+    #[test]
+    fn lower_full_and_auto_keywords() {
+        assert_eq!(
+            lowered_method_names(&["w-full", "h-full", "size-full", "w-auto", "h-auto"]),
+            vec!["w_full", "h_full", "size_full", "w_auto", "h_auto"],
+        );
+    }
+
+    #[test]
+    fn lower_fractional_widths_listed_in_spec() {
+        // The spec enumerates these four fractions and only these four
+        // (lines 198). w-1/4, w-1/5, etc. must remain UnknownClass.
+        assert_eq!(
+            lowered_method_names(&["w-1/2", "w-1/3", "w-2/3", "w-3/4"]),
+            vec!["w_1_2", "w_1_3", "w_2_3", "w_3_4"],
+        );
+    }
+
+    #[test]
+    fn fractional_width_token_survives_tokenizer() {
+        // The class tokenizer in `parse::split_classes` only splits on
+        // whitespace, so `/` stays inside a single class token. Drive
+        // this through the full pipeline (parse -> class lower) to pin
+        // the contract end-to-end, not just the unit-level lowering.
+        let nodes = crate::parse::parse(r#"<div class="flex w-1/2 gap-2"></div>"#).unwrap();
+        let crate::ast::Node::Element(e) = &nodes[0] else {
+            panic!("expected element");
+        };
+        let classes: Vec<&str> = e.classes.iter().map(|c| c.raw.as_str()).collect();
+        assert_eq!(classes, vec!["flex", "w-1/2", "gap-2"]);
+
+        let methods = lower_classes(&e.classes).expect("classes should lower");
+        let names: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["flex", "w_1_2", "gap_2"]);
+    }
+
+    #[test]
+    fn out_of_spec_sizing_is_unknown() {
+        // Each of these is something a Tailwind user would expect to
+        // work but the v0.1 Size section doesn't list:
+        //   - w-screen / h-screen: viewport keywords (gpui has w_screen,
+        //     spec just doesn't enumerate it yet)
+        //   - max-w-128: tailwind-config-extended scale (custom token)
+        //   - w-1/4 / w-2/4 / w-1/5: fractions outside the four the
+        //     spec lists
+        //   - w-13: contiguous-range gap
+        //   - w-99: well past every allowed step
+        //   - w-foo: non-numeric, non-keyword
+        for raw in [
+            "w-screen",
+            "h-screen",
+            "max-w-128",
+            "w-1/4",
+            "w-2/4",
+            "w-1/5",
+            "w-13",
+            "w-99",
+            "w-foo",
+        ] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sizing_jump_steps_share_spacing_scale() {
+        // The spacing scale extension landed in #10 covers sizing too
+        // because `lower_sizing` reuses `parse_spacing_step`. Pin that
+        // contract here so it can't regress without the test breaking.
+        assert_eq!(
+            lowered_method_names(&["w-16", "h-20", "size-24", "max-w-32"]),
+            vec!["w_16", "h_20", "size_24", "max_w_32"],
+        );
+    }
+
+    #[test]
+    fn sizing_classes_preserve_source_order() {
+        assert_eq!(
+            lowered_method_names(&["w-full", "h-full", "min-w-4", "max-w-12"]),
+            vec!["w_full", "h_full", "min_w_4", "max_w_12"],
         );
     }
 }
