@@ -20,9 +20,19 @@
 
 use crate::ast::{Element, Node, TextNode};
 use crate::class_map::{lower_classes_with_styles, MethodCall, StyleMap};
+use crate::manifest::ThemeManifest;
 use crate::{css, CodegenError, Error, Span};
 
-/// Compile a parsed node tree into gpui builder Rust source.
+/// Compile a parsed node tree into gpui builder Rust source using the
+/// compiler's built-in defaults (no manifest).
+///
+/// Equivalent to [`emit_with_manifest`] called with `None`.
+pub fn emit(nodes: &[Node]) -> Result<String, Error> {
+    emit_with_manifest(nodes, None)
+}
+
+/// Compile a parsed node tree, optionally validating theme tokens and
+/// resolving custom-scale sizing utilities against a [`ThemeManifest`].
 ///
 /// `Node::Style` entries are filtered out before applying the
 /// "exactly one root" rule — they're metadata for the static-CSS
@@ -31,7 +41,10 @@ use crate::{css, CodegenError, Error, Span};
 /// rules in `<style>` apply alongside utility classes from `class=`.
 /// The same filter applies inside element children so a nested
 /// `<style>` doesn't produce an empty `.child()` call.
-pub fn emit(nodes: &[Node]) -> Result<String, Error> {
+pub fn emit_with_manifest(
+    nodes: &[Node],
+    manifest: Option<&ThemeManifest>,
+) -> Result<String, Error> {
     // Collect every `<style>` node anywhere in the AST, parse and
     // lower its CSS, and merge into one map. Same class appearing in
     // multiple stylesheets (or repeated within one) gets all rules
@@ -65,7 +78,7 @@ pub fn emit(nodes: &[Node]) -> Result<String, Error> {
     match ui_nodes[0] {
         Node::Element(e) => {
             let mut out = String::new();
-            emit_element(e, &style_map, &mut out)?;
+            emit_element(e, &style_map, manifest, &mut out)?;
             Ok(out)
         }
         Node::Text(t) => Err(Error::Codegen(CodegenError {
@@ -115,9 +128,14 @@ fn is_metadata(node: &Node) -> bool {
     matches!(node, Node::Style(_))
 }
 
-fn emit_node(node: &Node, style_map: &StyleMap, out: &mut String) -> Result<(), Error> {
+fn emit_node(
+    node: &Node,
+    style_map: &StyleMap,
+    manifest: Option<&ThemeManifest>,
+    out: &mut String,
+) -> Result<(), Error> {
     match node {
-        Node::Element(e) => emit_element(e, style_map, out),
+        Node::Element(e) => emit_element(e, style_map, manifest, out),
         Node::Text(t) => {
             emit_text_literal(t, out);
             Ok(())
@@ -128,7 +146,12 @@ fn emit_node(node: &Node, style_map: &StyleMap, out: &mut String) -> Result<(), 
     }
 }
 
-fn emit_element(el: &Element, style_map: &StyleMap, out: &mut String) -> Result<(), Error> {
+fn emit_element(
+    el: &Element,
+    style_map: &StyleMap,
+    manifest: Option<&ThemeManifest>,
+    out: &mut String,
+) -> Result<(), Error> {
     // Map the source tag to its gpui constructor + tag-specific
     // default method calls. `div`/`span` keep their literal name; the
     // semantic tags (`p`, `h1..h3`, `button`) all use `div()` because
@@ -147,7 +170,7 @@ fn emit_element(el: &Element, style_map: &StyleMap, out: &mut String) -> Result<
         emit_method_call(&m, out);
     }
 
-    let methods = lower_classes_with_styles(&el.classes, style_map)?;
+    let methods = lower_classes_with_styles(&el.classes, style_map, manifest)?;
     for m in &methods {
         emit_method_call(m, out);
     }
@@ -171,7 +194,7 @@ fn emit_element(el: &Element, style_map: &StyleMap, out: &mut String) -> Result<
 
     for child in el.children.iter().filter(|c| !is_metadata(c)) {
         out.push_str(".child(");
-        emit_node(child, style_map, out)?;
+        emit_node(child, style_map, manifest, out)?;
         out.push(')');
     }
 
@@ -629,5 +652,105 @@ mod tests {
             out,
             r#"div().text_xl().font_weight(FontWeight::SEMIBOLD).id("exec-plan").child("Execution Plan")"#
         );
+    }
+
+    // ---------- theme manifest integration ---------------------------------
+
+    fn compile_with(src: &str, manifest: &crate::ThemeManifest) -> Result<String, Error> {
+        let nodes = crate::parse::parse(src)?;
+        emit_with_manifest(&nodes, Some(manifest))
+    }
+
+    fn small_manifest() -> crate::ThemeManifest {
+        crate::ThemeManifest::from_toml(
+            r##"
+            [colors]
+            accent = "#6366f1"
+            "accent-foreground" = "#ffffff"
+            primary = "#fafafa"
+
+            [max-width]
+            "128" = "32rem"
+            "page" = "48rem"
+            "##,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn manifest_unknown_color_token_rejects_at_bg() {
+        let m = small_manifest();
+        let err = compile_with(r#"<div class="bg-not-a-real"></div>"#, &m).unwrap_err();
+        match err {
+            Error::UnknownThemeToken { token, .. } => {
+                assert_eq!(token, "not-a-real");
+            }
+            other => panic!("expected UnknownThemeToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_known_color_passes_at_bg_text_border() {
+        let m = small_manifest();
+        // Hyphenated theme tokens still normalize for the Rust ident
+        // (`accent-foreground` → `theme.accent_foreground`) even with
+        // a manifest in scope.
+        let out = compile_with(
+            r#"<div class="bg-accent text-primary border-accent-foreground"></div>"#,
+            &m,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "div().bg(theme.accent).text_color(theme.primary).border_color(theme.accent_foreground)"
+        );
+    }
+
+    #[test]
+    fn manifest_custom_max_w_resolves_via_lookup() {
+        let m = small_manifest();
+        // `max-w-128` exists in the manifest as `rems(32.0)` and
+        // resolves through the manifest path (not the built-in
+        // compat exemption).
+        let out = compile_with(r#"<div class="max-w-128 max-w-page"></div>"#, &m).unwrap();
+        assert_eq!(out, "div().max_w(rems(32.0)).max_w(rems(48.0))");
+    }
+
+    #[test]
+    fn manifest_unknown_custom_max_w_still_unknown_class() {
+        let m = small_manifest();
+        // `max-w-card` isn't in the manifest → falls through to the
+        // existing `UnknownClass` + v0.2-manifest hint path.
+        let err = compile_with(r#"<div class="max-w-card"></div>"#, &m).unwrap_err();
+        assert!(matches!(err, Error::UnknownClass { .. }));
+    }
+
+    #[test]
+    fn no_manifest_back_compat_max_w_128_still_resolves() {
+        // Without a manifest, the built-in single-token compatibility
+        // exemption still resolves `max-w-128`. Pre-manifest fixtures
+        // (the Ato Desktop preview) must keep compiling unchanged.
+        let out = compile(r#"<div class="max-w-128"></div>"#).unwrap();
+        assert_eq!(out, "div().max_w(rems(32.0))");
+    }
+
+    #[test]
+    fn no_manifest_back_compat_theme_tokens_pass_through() {
+        // Without a manifest, theme tokens pass through symbolically
+        // (no UnknownThemeToken even for unknown names — rustc
+        // validates downstream).
+        let out = compile(r#"<div class="bg-totally-made-up text-foo"></div>"#).unwrap();
+        assert_eq!(out, "div().bg(theme.totally_made_up).text_color(theme.foo)");
+    }
+
+    #[test]
+    fn manifest_unknown_color_token_rejects_at_text_and_border_too() {
+        let m = small_manifest();
+        // text-X and border-X paths both validate against [colors].
+        let err = compile_with(r#"<div class="text-unknown"></div>"#, &m).unwrap_err();
+        assert!(matches!(err, Error::UnknownThemeToken { .. }));
+
+        let err = compile_with(r#"<div class="border-unknown"></div>"#, &m).unwrap_err();
+        assert!(matches!(err, Error::UnknownThemeToken { .. }));
     }
 }
