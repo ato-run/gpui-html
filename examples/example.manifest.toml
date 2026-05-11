@@ -1,0 +1,39 @@
+# Example gpui-html theme manifest.
+#
+# Pass with `gpui-html compile --manifest examples/example.manifest.toml ...`
+# to tighten theme-token validation and resolve custom-scale sizing
+# utilities. Without a manifest, the compiler falls back to its v0.1
+# built-in defaults (symbolic theme-token pass-through, single
+# `max-w-128` compatibility exemption).
+#
+# This file matches the colors and custom scales declared in the Ato
+# Desktop preview's Tailwind config (`examples/ato-desktop-preview.gpui.html`)
+# so the preview compiles against this manifest without UnknownThemeToken
+# diagnostics.
+
+[colors]
+# Surfaces
+base    = "#09090b"
+surface = "#09090b"
+elevated = "#18181b"
+card    = "#18181b"
+hover   = "#1f1f23"
+border  = "#27272a"
+subtle  = "#1c1c1f"
+medium  = "#3f3f46"
+# Foregrounds
+primary   = "#fafafa"
+secondary = "#d4d4d8"
+body      = "#a1a1aa"
+muted     = "#71717a"
+ghost     = "#52525b"
+# Accents
+accent              = "#6366f1"
+"accent-foreground" = "#ffffff"
+# Status / traffic lights
+rose  = "#ff5f57"
+amber = "#febc2e"
+green = "#28c840"
+
+[max-width]
+"128" = "32rem"
