@@ -76,7 +76,8 @@ mod tests {
             span: Span::new(10, 23),
             hint: Some("gpui has no `Overflow::Auto`. Use `overflow-y-scroll`.".into()),
         };
-        let diag = Diagnostic::from_error(&err, "<div class=\"overflow-auto\">", Some("x.gpui.html"));
+        let diag =
+            Diagnostic::from_error(&err, "<div class=\"overflow-auto\">", Some("x.gpui.html"));
         let json = serde_json::to_string(&diag).unwrap();
         let back: Diagnostic = serde_json::from_str(&json).unwrap();
         assert_eq!(diag, back);

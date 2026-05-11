@@ -77,7 +77,11 @@ impl std::fmt::Display for Format {
 
 fn main() -> ExitCode {
     match Cli::parse().cmd {
-        Cmd::Compile { input, output, format } => run_compile(input, output, format),
+        Cmd::Compile {
+            input,
+            output,
+            format,
+        } => run_compile(input, output, format),
         Cmd::Check { input, format } => run_check(input, format),
     }
 }
@@ -131,12 +135,7 @@ fn run_check(input: PathBuf, format: Format) -> ExitCode {
     }
 }
 
-fn report_error(
-    err: &gpui_html_core::Error,
-    src: &str,
-    input: Option<&PathBuf>,
-    format: Format,
-) {
+fn report_error(err: &gpui_html_core::Error, src: &str, input: Option<&PathBuf>, format: Format) {
     let file = input.map(|p| p.display().to_string());
     let diag = Diagnostic::from_error(err, src, file.as_deref());
     let stderr = std::io::stderr();

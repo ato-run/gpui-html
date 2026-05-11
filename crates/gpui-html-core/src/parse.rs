@@ -396,9 +396,7 @@ fn split_classes(value: &str, value_span: Span) -> Vec<ClassToken> {
             break;
         }
         let rest = &value[byte_offset..];
-        let tok_len = rest
-            .find(char::is_whitespace)
-            .unwrap_or(rest.len());
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let raw = &rest[..tok_len];
         let start = value_span.start + byte_offset;
         let end = start + tok_len;
@@ -451,10 +449,7 @@ mod tests {
             panic!("element");
         };
         assert_eq!(
-            e.classes
-                .iter()
-                .map(|c| c.raw.as_str())
-                .collect::<Vec<_>>(),
+            e.classes.iter().map(|c| c.raw.as_str()).collect::<Vec<_>>(),
             vec!["flex", "flex-col", "gap-2"]
         );
         // Spans are populated and disjoint.
