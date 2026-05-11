@@ -73,6 +73,20 @@
 //!   (font-family is an app-shell concern, see #19), `whitespace-nowrap`,
 //!   `whitespace-normal`, `text-ellipsis` (subsumed by `truncate`).
 //!
+//! Border (numeric widths share the v0.1 spacing scale):
+//!   border             -> .border_1()                  (bare = 1px)
+//!   border-N           -> .border_N()
+//!   border-{t,r,b,l}   -> .border_{t,r,b,l}_1()        (bare = 1px,
+//!                                                       same rule as bare 'border')
+//!   border-{t,r,b,l}-N -> .border_{t,r,b,l}_N()
+//!   border-dashed      -> .border_dashed()
+//!   border-<token>     -> .border_color(theme.<token>)
+//!
+//!   Disambiguation: `border-N` is width (digits), `border-<ident>` is a
+//!   theme color token. `border-border` is therefore the user's `theme.border`
+//!   color, *not* a recursive width. The matcher tries width-shaped values
+//!   first, then falls back to theme-token shape.
+//!
 //! Color (symbolic theme tokens):
 //!   bg-<token>      -> .bg(theme.<token>)
 //!   text-<token>    -> .text_color(theme.<token>)
@@ -184,6 +198,10 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
     }
 
     if let Some(call) = lower_typography(raw) {
+        return Ok(call);
+    }
+
+    if let Some(call) = lower_border(raw) {
         return Ok(call);
     }
 
@@ -477,6 +495,66 @@ fn typography_rejection_hint(raw: &str) -> Option<String> {
         ),
         _ => None,
     }
+}
+
+/// Lower a Tailwind border utility (width / directional width / dashed /
+/// theme-color) to its gpui builder method.
+///
+/// Disambiguation precedence after the bare keyword and style cases:
+///   1. directional + numeric (`border-t-2`)
+///   2. directional bare (`border-t`)        → spec extension, see PR/below
+///   3. plain numeric (`border-12`)          → width
+///   4. theme token (`border-border`)        → color
+///
+/// Bare directional handling — `border-t`, `border-r`, `border-b`,
+/// `border-l` (no number) — is a small *spec interpretation* rather
+/// than a literal reading: the spec lists `border` (no suffix) → 1px
+/// and `border-<side>-<n>` (with a number) explicitly, but the standard
+/// Tailwind/preview UI convention is that bare directional shorthands
+/// also resolve to 1px on that side. We extend the "bare = 1px" rule
+/// from `border` to the directional variants because (a) gpui's `Styled`
+/// already exposes `border_t_1`/`border_r_1`/`border_b_1`/`border_l_1`,
+/// (b) the Ato Desktop preview fixture in #9 relies on this, and
+/// (c) refusing it would make the diagnostic misleading
+/// (`border-b` would lower as `border_color(theme.b)`, which is even
+/// worse than UnknownClass). PR description calls this out for review.
+fn lower_border(raw: &str) -> Option<MethodCall> {
+    // Bare keyword and style keyword cases short-circuit before any
+    // prefix manipulation.
+    if raw == "border" {
+        return Some(MethodCall::nullary("border_1"));
+    }
+    if raw == "border-dashed" {
+        return Some(MethodCall::nullary("border_dashed"));
+    }
+
+    let rest = raw.strip_prefix("border-")?;
+
+    // Directional cases: bare side (`t` / `r` / `b` / `l`) and side+N
+    // (`t-2`, `b-3`, ...). These must come before the plain numeric and
+    // theme-token branches so `border-b` doesn't get claimed as a theme
+    // color named `b`.
+    for side in ["t", "r", "b", "l"] {
+        if rest == side {
+            return Some(MethodCall::nullary(&format!("border_{side}_1")));
+        }
+        if let Some(num_str) = rest.strip_prefix(&format!("{side}-")) {
+            return parse_spacing_step(num_str)
+                .map(|n| MethodCall::nullary(&format!("border_{side}_{n}")));
+        }
+    }
+
+    // Plain numeric width: `border-N`.
+    if let Some(n) = parse_spacing_step(rest) {
+        return Some(MethodCall::nullary(&format!("border_{n}")));
+    }
+
+    // Theme color: `border-<ident>`.
+    if is_theme_token(rest) {
+        return Some(MethodCall::unary("border_color", format!("theme.{rest}")));
+    }
+
+    None
 }
 
 /// v0.1 spacing scale per `docs/spec.md`: contiguous 0..=12 plus the
@@ -1143,6 +1221,165 @@ mod tests {
                 "truncate",
                 "line_clamp",
             ]
+        );
+    }
+
+    // ---------- issue #14: border -----------------------------------------
+
+    #[test]
+    fn lower_bare_border_is_one_pixel() {
+        // Spec line 247: bare 'border' resolves to 1px width.
+        assert_eq!(lowered_method_names(&["border"]), vec!["border_1"],);
+    }
+
+    #[test]
+    fn lower_numeric_border_widths() {
+        // Contiguous + jump-step values from the v0.1 spacing scale
+        // (spec line 248).
+        assert_eq!(
+            lowered_method_names(&[
+                "border-0",
+                "border-1",
+                "border-4",
+                "border-12",
+                "border-16",
+                "border-32",
+            ]),
+            vec![
+                "border_0",
+                "border_1",
+                "border_4",
+                "border_12",
+                "border_16",
+                "border_32",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_directional_border_widths() {
+        // Explicit numeric on each side (spec line 249).
+        assert_eq!(
+            lowered_method_names(&[
+                "border-t-1",
+                "border-r-2",
+                "border-b-3",
+                "border-l-4",
+                "border-t-12",
+                "border-b-16",
+            ]),
+            vec![
+                "border_t_1",
+                "border_r_2",
+                "border_b_3",
+                "border_l_4",
+                "border_t_12",
+                "border_b_16",
+            ],
+        );
+    }
+
+    #[test]
+    fn lower_bare_directional_border_resolves_to_one_pixel() {
+        // Spec interpretation (see lower_border doc comment): the
+        // "bare = 1px" rule from the spec extends to the directional
+        // shorthands. The Ato Desktop preview fixture relies on this
+        // (`border-b`, `border-r`).
+        assert_eq!(
+            lowered_method_names(&["border-t", "border-r", "border-b", "border-l"]),
+            vec!["border_t_1", "border_r_1", "border_b_1", "border_l_1"],
+        );
+    }
+
+    #[test]
+    fn lower_border_dashed_keyword() {
+        assert_eq!(
+            lowered_method_names(&["border-dashed"]),
+            vec!["border_dashed"],
+        );
+    }
+
+    #[test]
+    fn lower_border_theme_color_token() {
+        // `border-<ident>` is the theme-color path. Verify the unary
+        // method call shape (`.border_color(theme.<token>)`).
+        let calls = lower_classes(&[tok("border-border")]).unwrap();
+        assert_eq!(
+            calls,
+            vec![MethodCall::unary("border_color", "theme.border".into())]
+        );
+
+        // Other identifier-shaped tokens follow the same pattern.
+        let calls = lower_classes(&[tok("border-accent")]).unwrap();
+        assert_eq!(
+            calls,
+            vec![MethodCall::unary("border_color", "theme.accent".into())]
+        );
+    }
+
+    #[test]
+    fn border_width_and_color_compose_on_one_element() {
+        // The acceptance criterion from issue #14:
+        //   class="border border-border" → .border_1().border_color(theme.border)
+        //
+        // Source order is preserved (gpui builder semantics) and the
+        // disambiguation works without ambiguity.
+        let calls = lower_classes(&[tok("border"), tok("border-border")]).unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                MethodCall::nullary("border_1"),
+                MethodCall::unary("border_color", "theme.border".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn out_of_range_border_width_is_unknown() {
+        // 13/14/15 are the contiguous-range gap. 99 is well past every
+        // allowed step. `border-foo` is non-numeric and is also not a
+        // valid Rust identifier, so it falls through to UnknownClass
+        // (and is_theme_token rejects "foo" with an internal hyphen
+        // shape — but plain "foo" is a valid ident, so this verifies
+        // *only* the numeric path rejects out-of-range).
+        for raw in [
+            "border-13",
+            "border-14",
+            "border-15",
+            "border-99",
+            "border-t-13",
+        ] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn border_with_invalid_identifier_is_unknown() {
+        // A non-ident, non-numeric, non-keyword tail must reject. The
+        // hint check verifies it's UnknownClass (not theme color).
+        for raw in [
+            "border-1px",        // mixed digit/letter, neither width nor ident
+            "border-some-color", // hyphenated, fails is_theme_token
+        ] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn border_classes_preserve_source_order() {
+        // Mixed border utilities (width + directional + dashed + color)
+        // keep the source order through lowering.
+        assert_eq!(
+            lowered_method_names(&["border-2", "border-t-1", "border-dashed"]),
+            vec!["border_2", "border_t_1", "border_dashed"],
         );
     }
 }
