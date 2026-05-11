@@ -45,7 +45,7 @@
 //! See `examples/example.manifest.toml` for a fuller example matched
 //! to the Ato Desktop preview fixture.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
@@ -57,11 +57,14 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThemeManifest {
     /// Names that may appear after `bg-` / `text-` / `border-` and in
-    /// CSS `var(--theme-X)`. Values from the TOML `[colors]` table are
-    /// discarded in v0.1 — only the *key set* is used for validation.
-    /// Color values become load-bearing once #23 (theme-token alpha)
-    /// lands.
-    colors: HashSet<String>,
+    /// CSS `var(--theme-X)`, mapped to their packed RGBA bytes parsed
+    /// from the TOML `[colors]` table. Values are load-bearing for #23
+    /// (theme-token alpha): `bg-<name>/<n>` lowers to a literal
+    /// `gpui::rgba(0xRRGGBBAA)` by combining the manifest's RGB with
+    /// the slash-alpha. Plain `bg-<name>` (no slash) still lowers as
+    /// `theme.<name>` and ignores the manifest's value — host runtime
+    /// owns the color.
+    colors: HashMap<String, [u8; 4]>,
     /// `max-w-<suffix>` custom scale entries. Value is a CSS length
     /// string converted to a `rems(N.0)` Rust expression.
     max_width: HashMap<String, String>,
@@ -85,6 +88,10 @@ pub enum ManifestError {
         key: String,
         value: String,
     },
+    /// A `[colors]` entry value isn't a hex string the parser
+    /// recognises. v0.1 accepts `#rgb`, `#rrggbb`, and `#rrggbbaa`
+    /// (case-insensitive).
+    InvalidColor { name: String, value: String },
 }
 
 impl std::fmt::Display for ManifestError {
@@ -99,6 +106,12 @@ impl std::fmt::Display for ManifestError {
                 f,
                 "manifest [{section}] entry `{key} = \"{value}\"` is not a \
                  supported CSS length (v0.1 accepts only `<n>rem` and `<n>px`)"
+            ),
+            ManifestError::InvalidColor { name, value } => write!(
+                f,
+                "manifest [colors] entry `{name} = \"{value}\"` is not a \
+                 supported hex color (v0.1 accepts `#rgb`, `#rrggbb`, or \
+                 `#rrggbbaa`)"
             ),
         }
     }
@@ -132,7 +145,7 @@ impl ThemeManifest {
         let schema: Schema =
             toml::from_str(src).map_err(|e| ManifestError::Parse(e.to_string()))?;
 
-        let colors: HashSet<String> = schema.colors.into_keys().collect();
+        let colors = convert_colors_table(schema.colors)?;
         let max_width = convert_scale_table("max-width", schema.max_width)?;
         let max_height = convert_scale_table("max-height", schema.max_height)?;
         let min_width = convert_scale_table("min-width", schema.min_width)?;
@@ -153,13 +166,24 @@ impl ThemeManifest {
     /// Names are matched by the *original* hyphenated form, not the
     /// snake-case Rust ident — TOML keys can be hyphenated freely.
     pub fn knows_color(&self, name: &str) -> bool {
-        self.colors.contains(name)
+        self.colors.contains_key(name)
     }
 
     /// The set of declared color names. Exposed for diagnostics that
     /// want to suggest the closest match on rejection.
     pub fn color_names(&self) -> impl Iterator<Item = &str> {
-        self.colors.iter().map(String::as_str)
+        self.colors.keys().map(String::as_str)
+    }
+
+    /// Look up the parsed RGBA bytes for a declared color token. Used by
+    /// the `bg-<name>/<alpha>` lowering path (#23) to build the
+    /// `gpui::rgba(0xRRGGBBAA)` literal: the RGB channels come from this
+    /// table and the alpha byte is overwritten by the slash suffix.
+    /// Returns `None` for unknown names — callers should pair with
+    /// `knows_color` for the validation message rather than relying on
+    /// the `None` here.
+    pub fn lookup_color_rgba(&self, name: &str) -> Option<[u8; 4]> {
+        self.colors.get(name).copied()
     }
 
     /// Look up `max-w-<key>` → pre-formatted `rems(N.0)` expression
@@ -180,6 +204,85 @@ impl ThemeManifest {
     pub fn lookup_min_height(&self, suffix: &str) -> Option<&str> {
         self.min_height.get(suffix).map(String::as_str)
     }
+}
+
+/// Translate each `(name, toml_value)` entry in `[colors]` into
+/// `(name, [r, g, b, a])`. Values must be strings of the form `#rgb`,
+/// `#rrggbb`, or `#rrggbbaa` — anything else (a non-string, an unknown
+/// hex shape, non-hex digits, etc.) returns `InvalidColor` so manifest
+/// authors learn at load time, not at lowering time.
+///
+/// `#rgb` short form expands `#abc` → `#aabbcc` per CSS rules. `#rrggbb`
+/// defaults alpha to `0xff`. `#rrggbbaa` keeps its alpha — though the
+/// theme-token alpha lowering (#23) overrides it with the slash alpha
+/// at the call site.
+fn convert_colors_table(
+    table: HashMap<String, toml::Value>,
+) -> Result<HashMap<String, [u8; 4]>, ManifestError> {
+    let mut out = HashMap::with_capacity(table.len());
+    for (name, value) in table {
+        let raw = match value {
+            toml::Value::String(s) => s,
+            other => {
+                return Err(ManifestError::InvalidColor {
+                    name,
+                    value: format!("{other:?}"),
+                });
+            }
+        };
+        let rgba = parse_hex_color(&raw).ok_or_else(|| ManifestError::InvalidColor {
+            name: name.clone(),
+            value: raw.clone(),
+        })?;
+        out.insert(name, rgba);
+    }
+    Ok(out)
+}
+
+/// Parse a CSS hex color literal into packed `[r, g, b, a]` bytes.
+/// Accepts the three v0.1 shapes:
+///
+/// - `#rgb`    → each nibble doubled (`#abc` → `[0xaa, 0xbb, 0xcc, 0xff]`)
+/// - `#rrggbb` → alpha defaults to `0xff`
+/// - `#rrggbbaa`
+///
+/// Case-insensitive. Returns `None` for any other shape — `#rgba`
+/// (short form with alpha), 4-digit hex, named CSS colors (`red`),
+/// and `rgb()`/`hsl()` function calls all reject.
+fn parse_hex_color(raw: &str) -> Option<[u8; 4]> {
+    let hex = raw.strip_prefix('#')?;
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match hex.len() {
+        3 => {
+            let r = expand_nibble(&hex[0..1])?;
+            let g = expand_nibble(&hex[1..2])?;
+            let b = expand_nibble(&hex[2..3])?;
+            Some([r, g, b, 0xff])
+        }
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some([r, g, b, 0xff])
+        }
+        8 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            Some([r, g, b, a])
+        }
+        _ => None,
+    }
+}
+
+/// Expand a single hex nibble (`"a"`) into a byte (`0xaa`) per CSS
+/// short-form rules.
+fn expand_nibble(s: &str) -> Option<u8> {
+    let n = u8::from_str_radix(s, 16).ok()?;
+    Some(n * 17) // n * 0x11 == nibble doubled
 }
 
 /// Translate each `(suffix, css_length)` entry into
@@ -270,6 +373,95 @@ mod tests {
             names,
             vec!["accent", "accent-foreground", "base", "surface"]
         );
+    }
+
+    #[test]
+    fn colors_table_parses_rgba_for_alpha_lowering() {
+        // #23: alpha lowering reads the manifest's RGB and stitches the
+        // slash alpha onto it. Lock down the parser for the three
+        // accepted hex shapes.
+        let m = parse_ok(
+            r##"
+            [colors]
+            accent  = "#6366f1"
+            short   = "#abc"
+            "with-a" = "#11223344"
+            "##,
+        );
+        assert_eq!(
+            m.lookup_color_rgba("accent"),
+            Some([0x63, 0x66, 0xf1, 0xff])
+        );
+        assert_eq!(m.lookup_color_rgba("short"), Some([0xaa, 0xbb, 0xcc, 0xff]));
+        assert_eq!(
+            m.lookup_color_rgba("with-a"),
+            Some([0x11, 0x22, 0x33, 0x44])
+        );
+        assert_eq!(m.lookup_color_rgba("unknown"), None);
+    }
+
+    #[test]
+    fn colors_table_accepts_uppercase_hex() {
+        // Manifest authors may copy-paste from design tools that emit
+        // uppercase hex. Accept either case — output is lowercase by
+        // codegen convention, not parser convention.
+        let m = parse_ok(
+            r##"
+            [colors]
+            accent = "#6366F1"
+            "##,
+        );
+        assert_eq!(
+            m.lookup_color_rgba("accent"),
+            Some([0x63, 0x66, 0xf1, 0xff])
+        );
+    }
+
+    #[test]
+    fn colors_table_rejects_invalid_hex_shapes() {
+        // 4-digit hex (short-form with alpha) and named colors aren't
+        // in v0.1's accepted set — the parser rejects them at load time
+        // so authors learn before lowering.
+        for value in ["#rgba", "#1234", "red", "rgb(0, 0, 0)", "#12", "#1234567"] {
+            let toml = format!("[colors]\n\"x\" = \"{value}\"");
+            let err = ThemeManifest::from_toml(&toml).unwrap_err();
+            match err {
+                ManifestError::InvalidColor {
+                    name,
+                    value: got_value,
+                } => {
+                    assert_eq!(name, "x");
+                    assert_eq!(got_value, value);
+                }
+                other => panic!("expected InvalidColor for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn colors_table_rejects_non_hex_digits() {
+        // `#xxyyzz` has the right shape but the hex digits aren't valid.
+        let err = ThemeManifest::from_toml(
+            r##"[colors]
+"foo" = "#xxyyzz""##,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidColor { .. }));
+    }
+
+    #[test]
+    fn colors_table_rejects_non_string_values() {
+        // A misformatted manifest that puts a number where a hex string
+        // belongs surfaces as InvalidColor, not silent ignore.
+        let err = ThemeManifest::from_toml(
+            r#"[colors]
+"foo" = 42"#,
+        )
+        .unwrap_err();
+        match err {
+            ManifestError::InvalidColor { name, .. } => assert_eq!(name, "foo"),
+            other => panic!("expected InvalidColor, got {other:?}"),
+        }
     }
 
     #[test]
