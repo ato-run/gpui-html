@@ -41,7 +41,17 @@
 use crate::ast::{Attr, ClassToken, Element, Node, Span, StyleNode, TextNode};
 use crate::{Error, ParseError, ParseErrorKind};
 
-const SUPPORTED_TAGS: &[&str] = &["div", "span"];
+/// UI tags accepted by the parser. Anything outside this list (and the
+/// document-compat tags below) surfaces as `UnknownTag`.
+///
+/// `div` and `span` lower to their literal gpui constructors. The
+/// remaining tags (`p`, `h1`, `h2`, `h3`, `button`) all lower to
+/// `div()` with tag-specific default method calls emitted before the
+/// user's class chain — see `codegen::tag_constructor_and_defaults`.
+/// `img` / `icon` / `slot` from the spec table are still deferred:
+/// they need asset / component-registry / runtime support that v0.1
+/// doesn't yet model.
+const SUPPORTED_TAGS: &[&str] = &["div", "span", "p", "h1", "h2", "h3", "button"];
 const SUPPORTED_ATTRS: &[&str] = &["class", "id"];
 
 const WRAPPER_TAGS: &[&str] = &["html", "head", "body"];
@@ -911,10 +921,47 @@ mod tests {
 
     #[test]
     fn unknown_tag_is_caught_at_parse_time() {
-        let err = parse("<table></table>").unwrap_err();
-        match err {
-            Error::UnknownTag { tag, .. } => assert_eq!(tag, "table"),
-            other => panic!("expected UnknownTag, got {other:?}"),
+        // Anything outside the supported UI tag set + document-compat
+        // wrapper set rejects. `<table>` is in the spec but explicitly
+        // v0.2 territory; `<section>` / `<article>` etc. aren't in the
+        // spec at all.
+        for raw in [
+            "<table></table>",
+            "<section></section>",
+            "<article></article>",
+        ] {
+            let err = parse(raw).unwrap_err();
+            match err {
+                Error::UnknownTag { .. } => {}
+                other => panic!("expected UnknownTag for {raw:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_ui_tags_parse_with_class_and_children() {
+        // p / h1..h3 / button parse as elements with the usual class
+        // and child semantics. The codegen-side default-method
+        // emission is exercised in codegen::tests.
+        for raw in [
+            "<p>text</p>",
+            "<h1>Title</h1>",
+            "<h2 class=\"text-muted\">Sub</h2>",
+            "<h3>Three</h3>",
+            "<button class=\"bg-accent text-accent-foreground\">Click</button>",
+        ] {
+            let nodes = parse_ok(raw);
+            assert_eq!(nodes.len(), 1, "for input {raw:?}");
+            let Node::Element(e) = &nodes[0] else {
+                panic!("expected element for {raw:?}");
+            };
+            // Element tags survive in the AST verbatim; codegen looks
+            // them up to pick the constructor + defaults.
+            assert!(
+                matches!(e.tag.as_str(), "p" | "h1" | "h2" | "h3" | "button"),
+                "unexpected tag {:?}",
+                e.tag
+            );
         }
     }
 

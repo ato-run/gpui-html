@@ -148,9 +148,28 @@ v0.1 lowers exactly these. Anything else (e.g. `<table>`, `<section>`,
 <slot>    → Rust 側から差し込む child placeholder
 ```
 
-Note: only `<div>` and `<span>` are actually lowered today; the rest of
-the table is the v0.1 target. UI-tag matching is **case-sensitive**
-(unlike the document-compat tags above): write `<div>`, not `<DIV>`.
+Currently lowered: `<div>`, `<span>`, `<p>`, `<h1>`, `<h2>`, `<h3>`,
+`<button>`. `<img>`, `<icon>`, `<slot>` from the table remain
+deferred — they need asset / component-registry / runtime support
+that's outside the static-lowering surface.
+
+The semantic tags (`<p>`, `<h1..h3>`, `<button>`) all lower to
+`gpui::div()` (gpui has no dedicated constructor for them). For the
+headings the spec's explicit "text style" defaults are emitted
+*before* the user's class chain, so authors can override via the
+usual utility shorthand:
+
+```html
+<h1>Default heading</h1>
+<!-- → div().text_2xl().font_weight(FontWeight::BOLD).child("Default heading") -->
+
+<h1 class="text-sm font-normal">Overridden</h1>
+<!-- → div().text_2xl().font_weight(FontWeight::BOLD).text_sm().font_weight(FontWeight::NORMAL).child("Overridden") -->
+<!--   ^^ later builder calls override earlier ones (gpui builder semantics) -->
+```
+
+UI-tag matching is **case-sensitive** (unlike the document-compat tags
+above): write `<div>`, not `<DIV>`.
 
 v0.2 以降に延期するタグ。
 
