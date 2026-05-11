@@ -350,10 +350,10 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
         // Detect the shape and reject with an actionable hint instead
         // of falling through to the generic UnknownClass path. Palette
         // utilities with alpha (`bg-red-500/80`) don't match this branch
-        // (theme-token requires identifier shape) and keep their
-        // existing palette rejection through `hint_for`.
+        // (the token shape rejects palette via `normalize_theme_token`)
+        // and keep their existing palette rejection through `hint_for`.
         if let Some((token, alpha)) = rest.split_once('/') {
-            if is_theme_token(token)
+            if normalize_theme_token(token).is_some()
                 && !alpha.is_empty()
                 && alpha.chars().all(|c| c.is_ascii_digit())
             {
@@ -372,17 +372,21 @@ fn lower_one(tok: &ClassToken) -> Result<MethodCall, Error> {
             }
         }
 
-        if is_theme_token(rest) {
-            return Ok(MethodCall::unary("bg", format!("theme.{rest}")));
+        if let Some(normalized) = normalize_theme_token(rest) {
+            return Ok(MethodCall::unary("bg", format!("theme.{normalized}")));
         }
     }
 
     if let Some(token) = raw.strip_prefix("text-") {
         // text-xs..text-3xl are typography sizes (handled by
         // `lower_typography` above). Anything else under `text-` is a
-        // color theme token.
-        if is_theme_token(token) {
-            return Ok(MethodCall::unary("text_color", format!("theme.{token}")));
+        // color theme token — possibly hyphenated, normalized to
+        // snake_case for the Rust field access.
+        if let Some(normalized) = normalize_theme_token(token) {
+            return Ok(MethodCall::unary(
+                "text_color",
+                format!("theme.{normalized}"),
+            ));
         }
     }
 
@@ -715,9 +719,15 @@ fn lower_border(raw: &str) -> Option<MethodCall> {
         return Some(MethodCall::nullary(&format!("border_{n}")));
     }
 
-    // Theme color: `border-<ident>`.
-    if is_theme_token(rest) {
-        return Some(MethodCall::unary("border_color", format!("theme.{rest}")));
+    // Theme color: `border-<token>`. Hyphenated multi-word tokens
+    // (`border-accent-foreground`) normalize to snake_case for the
+    // Rust field name. Palette shapes (`border-red-500`) reject via
+    // `normalize_theme_token`'s numeric-segment guard.
+    if let Some(normalized) = normalize_theme_token(rest) {
+        return Some(MethodCall::unary(
+            "border_color",
+            format!("theme.{normalized}"),
+        ));
     }
 
     None
@@ -878,34 +888,107 @@ fn parse_spacing_step(rest: &str) -> Option<u32> {
     }
 }
 
-/// Theme tokens are identifier-shaped (Rust ident rules: leading letter
-/// or underscore, then letters/digits/underscores). Hyphens are not
-/// allowed because they'd collide with class-name segmentation.
-fn is_theme_token(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
+/// Normalize a Tailwind-style theme-token name to the Rust field name
+/// the codegen will splice into `theme.<...>`.
+///
+/// Accepts hyphenated multi-word tokens (`accent-foreground`,
+/// `muted-foreground`, `primary-hover`) and converts hyphens to
+/// underscores. Each hyphen-separated segment must be ident-shaped
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Returns `None` if any segment is empty
+/// or starts with a digit, *or* if any segment is purely numeric — the
+/// purely-numeric-last-segment shape is what makes Tailwind palette
+/// utilities (`red-500`, `slate-200`) palette utilities, and v0.1
+/// rejects those: the host theme is the source of truth, palette
+/// literals are out of scope.
+///
+/// Examples:
+///   `accent`              → `Some("accent")`
+///   `accent-foreground`   → `Some("accent_foreground")`
+///   `red-500`             → `None`        (palette: numeric segment)
+///   `2accent`             → `None`        (segment starts with digit)
+///   ``                    → `None`        (empty)
+///   `accent-`             → `None`        (empty trailing segment)
+///
+/// Used by both the utility-class path here and the CSS
+/// `var(--theme-X)` path in [`crate::css`] so the two surfaces apply
+/// identical disambiguation.
+pub(crate) fn normalize_theme_token(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let segments: Vec<&str> = raw.split('-').collect();
+    for seg in &segments {
+        if seg.is_empty() {
+            return None;
+        }
+        // Each segment must be ident-shaped on its own.
+        let mut chars = seg.chars();
+        let first = chars.next().unwrap();
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return None;
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        // A purely-numeric segment marks the palette pattern. Since
+        // each segment must already pass the ident-shape check above
+        // (which forbids leading digits), this only matters once we
+        // change the ident rule — but it's free defense in depth.
+        if seg.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(segments.join("_"))
 }
+
+// Note: an `is_theme_token` (single-segment, no-hyphens) check used to
+// live here. After #7 every call site moved to `normalize_theme_token`
+// (which subsumes the single-segment case), so the narrower variant
+// fell out of use and was removed. If a future caller really needs
+// "is this a plain ident, not a hyphenated multi-word token",
+// reintroduce it then — keeping dead code for hypothetical needs is
+// just churn.
 
 fn is_typography_size(s: &str) -> bool {
     matches!(s, "xs" | "sm" | "base" | "lg" | "xl" | "2xl" | "3xl")
+}
+
+/// Detect the Tailwind palette-utility shape (`<color>-<number>`,
+/// optionally with a `/<alpha>` opacity suffix).
+/// True when the input has at least two hyphen-separated segments and
+/// the last segment (before any `/alpha`) is purely numeric — that's
+/// what distinguishes `bg-red-500` (palette) from `bg-accent-foreground`
+/// (theme token), and lets `bg-red-500/80` still match the palette
+/// pattern even with the slash suffix attached.
+fn looks_like_palette(rest: &str) -> bool {
+    // Strip optional `/<alpha>` suffix so the palette check looks at
+    // `red-500` regardless of whether `/80` was appended.
+    let core = rest.split('/').next().unwrap_or(rest);
+    let segments: Vec<&str> = core.split('-').collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let last = segments.last().unwrap();
+    !last.is_empty() && last.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Best-effort hint shown on the LLM-facing diagnostic when a class is
 /// rejected. Kept terse — the diagnostic itself already carries the span,
 /// the literal, and the error code.
 fn hint_for(raw: &str) -> Option<String> {
-    if raw.starts_with("bg-") && raw.matches('-').count() >= 2 {
-        return Some(
-            "v0.1 only allows `bg-<ident>` against the caller's theme; \
-             palette utilities like `bg-red-500` are out of scope."
-                .into(),
-        );
+    // Palette-shape rejection across bg/text/border. The hint is
+    // shared because the underlying reason is the same on every
+    // prefix: v0.1 doesn't ship a Tailwind palette, only theme
+    // tokens against the host's `theme` struct.
+    for prefix in ["bg-", "text-", "border-"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            if looks_like_palette(rest) {
+                return Some(format!(
+                    "v0.1 only allows `{prefix}<token>` against the caller's theme; \
+                     palette utilities like `{prefix}red-500` are out of scope."
+                ));
+            }
+        }
     }
     None
 }
@@ -1014,13 +1097,10 @@ mod tests {
         assert!(matches!(err, Error::UnknownClass { .. }));
     }
 
-    #[test]
-    fn hyphenated_theme_token_is_rejected() {
-        // `bg-some-color` would be ambiguous with palette utilities, so
-        // theme tokens are restricted to identifier shape.
-        let err = lower_classes(&[tok("bg-some-color")]).unwrap_err();
-        assert!(matches!(err, Error::UnknownClass { .. }));
-    }
+    // (Removed in #7: `hyphenated_theme_token_is_rejected` pinned the
+    // pre-#7 contract where theme tokens were strictly single-segment
+    // idents. After #7, `bg-some-color` normalizes to
+    // `theme.some_color` — see `lower_hyphenated_bg_theme_token` below.)
 
     // ---------- issue #11: layout completion ------------------------------
 
@@ -1660,11 +1740,14 @@ mod tests {
 
     #[test]
     fn border_with_invalid_identifier_is_unknown() {
-        // A non-ident, non-numeric, non-keyword tail must reject. The
+        // Tails that don't shape as a theme token must reject. The
         // hint check verifies it's UnknownClass (not theme color).
+        // (`border-some-color` was here pre-#7 — it now normalizes to
+        // `theme.some_color`. See `lower_hyphenated_border_theme_token`.)
         for raw in [
-            "border-1px",        // mixed digit/letter, neither width nor ident
-            "border-some-color", // hyphenated, fails is_theme_token
+            "border-1px",     // mixed digit/letter, neither width nor ident
+            "border--accent", // empty leading segment
+            "border-accent-", // empty trailing segment
         ] {
             let err = lower_classes(&[tok(raw)]).unwrap_err();
             assert!(
@@ -2051,6 +2134,186 @@ mod tests {
         assert_eq!(
             lowered_method_names(&["rounded-lg", "shadow-lg", "rounded-tr-md", "shadow"]),
             vec!["rounded_lg", "shadow_lg", "rounded_tr_md", "shadow_md"],
+        );
+    }
+
+    // ---------- issue #7: hyphenated theme tokens ------------------------
+
+    fn lowered_calls(raw: &str) -> Vec<MethodCall> {
+        lower_classes(&[tok(raw)]).expect("class should lower")
+    }
+
+    #[test]
+    fn lower_hyphenated_bg_theme_token() {
+        // The classic case: a multi-word color name from the host theme.
+        // Hyphens become underscores at the Rust ident boundary; the
+        // class attribute keeps Tailwind-shape spelling.
+        assert_eq!(
+            lowered_calls("bg-accent-foreground"),
+            vec![MethodCall::unary("bg", "theme.accent_foreground".into())]
+        );
+        assert_eq!(
+            lowered_calls("bg-muted-foreground"),
+            vec![MethodCall::unary("bg", "theme.muted_foreground".into())]
+        );
+    }
+
+    #[test]
+    fn lower_hyphenated_text_theme_token() {
+        assert_eq!(
+            lowered_calls("text-accent-foreground"),
+            vec![MethodCall::unary(
+                "text_color",
+                "theme.accent_foreground".into()
+            )]
+        );
+        // Three segments still works.
+        assert_eq!(
+            lowered_calls("text-primary-hover-state"),
+            vec![MethodCall::unary(
+                "text_color",
+                "theme.primary_hover_state".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn lower_hyphenated_border_theme_token() {
+        assert_eq!(
+            lowered_calls("border-accent-foreground"),
+            vec![MethodCall::unary(
+                "border_color",
+                "theme.accent_foreground".into()
+            )]
+        );
+        // Single-segment still works (existing behavior preserved).
+        assert_eq!(
+            lowered_calls("border-border"),
+            vec![MethodCall::unary("border_color", "theme.border".into())]
+        );
+    }
+
+    #[test]
+    fn border_numeric_still_lowers_to_width() {
+        // The numeric-width branch in `lower_border` must keep
+        // priority over the (now hyphen-friendly) theme-token branch.
+        // `border-12` is width, not a theme color named `12`.
+        assert_eq!(
+            lowered_method_names(&["border-1", "border-2", "border-12"]),
+            vec!["border_1", "border_2", "border_12"],
+        );
+    }
+
+    #[test]
+    fn text_size_still_lowers_to_typography() {
+        // Typography sizes (text-xs..3xl) dispatch via `lower_typography`
+        // before the theme-token branch, so the new hyphenated theme
+        // logic doesn't change their behavior.
+        assert_eq!(
+            lowered_method_names(&["text-xs", "text-sm", "text-base", "text-lg", "text-2xl"]),
+            vec!["text_xs", "text_sm", "text_base", "text_lg", "text_2xl"],
+        );
+    }
+
+    #[test]
+    fn palette_utility_still_rejects_with_hint() {
+        // The crucial disambiguation: `bg-red-500` shape (numeric last
+        // segment) is palette, not a hyphenated theme token. Must still
+        // reject with the same actionable hint.
+        for raw in ["bg-red-500", "text-blue-300", "border-slate-200"] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            match err {
+                Error::UnknownClass { class, hint, .. } => {
+                    assert_eq!(class, raw);
+                    let hint = hint.unwrap_or_default();
+                    assert!(
+                        hint.contains("palette"),
+                        "expected palette hint for `{raw}`, got: {hint}"
+                    );
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn slash_alpha_routes_to_issue_23_for_theme_tokens() {
+        // `bg-accent-foreground/10` is theme-token alpha (deferred to
+        // #23). Must produce the #23 hint, not the palette hint —
+        // hyphenated theme tokens are theme tokens, not palette.
+        let err = lower_classes(&[tok("bg-accent-foreground/10")]).unwrap_err();
+        match err {
+            Error::UnknownClass { hint, .. } => {
+                let hint = hint.unwrap_or_default();
+                assert!(
+                    hint.contains("#23"),
+                    "expected #23-aware hint for hyphenated theme alpha, got: {hint}"
+                );
+            }
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_alpha_palette_still_rejects_with_palette_hint() {
+        // `bg-red-500/80` is palette + alpha. The token shape rejects
+        // via `normalize_theme_token`'s palette guard, so it falls
+        // through to `hint_for`, which now also recognizes the slash
+        // suffix when checking palette shape.
+        let err = lower_classes(&[tok("bg-red-500/80")]).unwrap_err();
+        match err {
+            Error::UnknownClass { hint, .. } => {
+                let hint = hint.unwrap_or_default();
+                assert!(
+                    hint.contains("palette"),
+                    "palette+alpha should keep the palette hint, got: {hint}"
+                );
+            }
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_theme_token_rejects() {
+        // Empty segments (leading, trailing, or doubled hyphens),
+        // segments starting with digits, and pure-numeric segments
+        // all reject — these aren't legal Rust idents.
+        for raw in [
+            "bg--accent",        // empty leading segment
+            "bg-accent-",        // empty trailing segment
+            "bg-2accent",        // segment starts with digit
+            "bg-accent--state",  // empty middle segment
+            "bg-accent-3-state", // numeric middle segment
+            "text-",             // empty after prefix
+        ] {
+            let err = lower_classes(&[tok(raw)]).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownClass { .. }),
+                "expected UnknownClass for `{raw}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn css_and_utility_theme_normalization_match() {
+        // The same shared `normalize_theme_token` helper drives both
+        // the utility-class side here and the CSS `var(--theme-X)`
+        // path in css.rs. Whatever Rust ident the utility produces
+        // for `text-accent-foreground` must match what CSS produces
+        // for `var(--theme-accent-foreground)`. Pinned end-to-end via
+        // the codegen integration so both surfaces stay in lockstep.
+        let utility = lowered_calls("text-accent-foreground");
+        assert_eq!(utility[0].args, vec!["theme.accent_foreground".to_string()]);
+
+        let nodes = crate::parse::parse(
+            r#"<html><head><style>.x { color: var(--theme-accent-foreground); }</style></head><body><div class="x"></div></body></html>"#,
+        )
+        .unwrap();
+        let out = crate::codegen::emit(&nodes).unwrap();
+        // `.x` from CSS should also reference `theme.accent_foreground`.
+        assert!(
+            out.contains("text_color(theme.accent_foreground)"),
+            "CSS theme-var normalization diverged from utility, got: {out}"
         );
     }
 }

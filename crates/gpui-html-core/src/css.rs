@@ -620,25 +620,19 @@ fn sizing_keyword_call(axis: &str, value: &str, span: Span) -> Result<MethodCall
 }
 
 /// Resolve a `var(--theme-<token>)` reference to `theme.<rust_ident>`.
-/// Hyphens in the token name become underscores so e.g.
+/// Hyphens in the token name become underscores via the shared
+/// [`crate::class_map::normalize_theme_token`] helper, so e.g.
 /// `var(--theme-accent-foreground)` lowers to `theme.accent_foreground`.
-/// This is the path that sidesteps the open question in #7 — CSS
-/// custom-property names always allow hyphens, so the disambiguation
-/// problem doesn't surface here.
+///
+/// Sharing the helper with the utility-class path (#7) means CSS and
+/// `class=` apply identical disambiguation: palette-shaped names
+/// (`red-500`) reject on both sides, hyphenated theme tokens accept on
+/// both sides, and the resulting Rust field name is the same.
 fn parse_theme_var(value: &str) -> Option<String> {
     let v = value.trim();
     let inner = v.strip_prefix("var(")?.strip_suffix(')')?.trim();
     let token = inner.strip_prefix("--theme-")?;
-    if token.is_empty() {
-        return None;
-    }
-    if !token
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return None;
-    }
-    Some(token.replace('-', "_"))
+    crate::class_map::normalize_theme_token(token)
 }
 
 fn theme_color_call(method: &str, value: &str, span: Span) -> Result<MethodCall, Error> {
