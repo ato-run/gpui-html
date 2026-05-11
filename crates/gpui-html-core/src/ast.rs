@@ -26,6 +26,13 @@ impl Span {
 pub enum Node {
     Element(Element),
     Text(TextNode),
+    /// Raw `<style>...</style>` content captured verbatim. The parser
+    /// consumes the inner CSS as raw text (no nested element parsing)
+    /// and stores it here for the static-CSS lowering pipeline (#27).
+    /// Codegen ignores `Style` nodes for v0.1: they don't count toward
+    /// root-element rules and don't emit any builder calls until #27
+    /// wires the lowering through.
+    Style(StyleNode),
 }
 
 impl Node {
@@ -33,6 +40,7 @@ impl Node {
         match self {
             Node::Element(e) => e.span,
             Node::Text(t) => t.span,
+            Node::Style(s) => s.span,
         }
     }
 }
@@ -52,6 +60,17 @@ pub struct Element {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextNode {
     pub text: String,
+    pub span: Span,
+}
+
+/// Captured `<style>` content. The `css` field holds the raw CSS source
+/// between the open and close tags (verbatim, no entity decoding). The
+/// `span` covers the entire `<style>...</style>` block so diagnostics
+/// can point at the exact source location of an offending rule once
+/// #27 lands the CSS lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleNode {
+    pub css: String,
     pub span: Span,
 }
 

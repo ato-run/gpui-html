@@ -95,7 +95,45 @@ Style field 書き換えに静的変換できなければならない。
 
 ## 対応タグ
 
-v0.1 では以下に絞る。
+### Document compatibility layer
+
+gpuiHTML accepts a **full HTML document** as input — the same source you
+would paste into a browser. The compiler is not a browser engine, so most
+of HTML is parsed-and-discarded, but the boilerplate doesn't have to be
+hand-stripped before invoking the compiler.
+
+```text
+<!DOCTYPE html>          → parsed, skipped (case-insensitive keyword)
+
+<html>, <head>, <body>   → transparent wrappers; their children flatten
+                           into the parent's node list, so wrappers don't
+                           reach codegen. Wrapper attrs are consumed and
+                           discarded. Tag-name match is case-insensitive.
+
+<meta>, <link>           → void metadata; parsed (loose attr handling)
+                           and dropped. No closing tag required.
+<title>...</title>       → raw-text metadata; body consumed and dropped.
+
+<script>...</script>     → raw-text skip. Body is consumed verbatim
+                           (so `<` inside JS doesn't try to start tags)
+                           and dropped. gpuiHTML never executes JS.
+
+<style>...</style>       → raw-text preserve. Body is consumed verbatim
+                           and stored on a `Node::Style` AST node for
+                           the static-CSS lowering pipeline. v0.1 does
+                           not parse the CSS itself; that lands in a
+                           follow-up.
+```
+
+The "compatibility layer" stays narrow on purpose: gpuiHTML still does
+not implement DOM, JavaScript runtime, CSSOM, or browser layout. The
+layer's job is just to let the same source serve as both a Tailwind
+preview (in a browser) and a gpuiHTML input (to the compiler).
+
+### UI tags
+
+v0.1 lowers exactly these. Anything else (e.g. `<table>`, `<section>`,
+`<button>`) is `UnknownTag` at parse time.
 
 ```html
 <div>     → gpui::div()
@@ -109,6 +147,10 @@ v0.1 では以下に絞る。
 <icon>    → registered icon component
 <slot>    → Rust 側から差し込む child placeholder
 ```
+
+Note: only `<div>` and `<span>` are actually lowered today; the rest of
+the table is the v0.1 target. UI-tag matching is **case-sensitive**
+(unlike the document-compat tags above): write `<div>`, not `<DIV>`.
 
 v0.2 以降に延期するタグ。
 

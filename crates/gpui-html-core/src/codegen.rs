@@ -23,41 +23,56 @@ use crate::class_map::{lower_classes, MethodCall};
 use crate::{CodegenError, Error, Span};
 
 /// Compile a parsed node tree into gpui builder Rust source.
+///
+/// `Node::Style` entries are filtered out before applying the
+/// "exactly one root" rule — they're metadata for the static-CSS
+/// lowering pipeline (#27), not UI nodes. The same filter applies
+/// inside element children so a nested `<style>` doesn't produce an
+/// empty `.child()` call.
 pub fn emit(nodes: &[Node]) -> Result<String, Error> {
-    let root = match nodes {
-        [Node::Element(e)] => e,
-        [] => {
-            return Err(Error::Codegen(CodegenError {
-                span: Span::new(0, 0),
-                message: "empty document — gpuiHTML requires exactly one root element".into(),
-            }));
-        }
-        [Node::Text(t), ..] => {
-            return Err(Error::Codegen(CodegenError {
-                span: t.span,
-                message: "top-level text is not allowed — wrap content in a single root element"
-                    .into(),
-            }));
-        }
-        roots => {
-            let span = roots
-                .iter()
-                .map(|n| match n {
-                    Node::Element(e) => e.span,
-                    Node::Text(t) => t.span,
-                })
-                .reduce(Span::merge)
-                .unwrap_or(Span::new(0, 0));
-            return Err(Error::Codegen(CodegenError {
-                span,
-                message: format!("expected exactly one root element, found {}", roots.len()),
-            }));
-        }
-    };
+    let ui_nodes: Vec<&Node> = nodes.iter().filter(|n| !is_metadata(n)).collect();
 
-    let mut out = String::new();
-    emit_element(root, &mut out)?;
-    Ok(out)
+    if ui_nodes.is_empty() {
+        return Err(Error::Codegen(CodegenError {
+            span: Span::new(0, 0),
+            message: "empty document — gpuiHTML requires exactly one root element".into(),
+        }));
+    }
+    if ui_nodes.len() > 1 {
+        let span = ui_nodes
+            .iter()
+            .map(|n| n.span())
+            .reduce(Span::merge)
+            .unwrap_or(Span::new(0, 0));
+        return Err(Error::Codegen(CodegenError {
+            span,
+            message: format!(
+                "expected exactly one root element, found {}",
+                ui_nodes.len()
+            ),
+        }));
+    }
+
+    match ui_nodes[0] {
+        Node::Element(e) => {
+            let mut out = String::new();
+            emit_element(e, &mut out)?;
+            Ok(out)
+        }
+        Node::Text(t) => Err(Error::Codegen(CodegenError {
+            span: t.span,
+            message: "top-level text is not allowed — wrap content in a single root element".into(),
+        })),
+        Node::Style(_) => unreachable!("filtered out by is_metadata above"),
+    }
+}
+
+/// Nodes that don't count as UI roots and aren't emitted by codegen.
+/// Currently just `Node::Style`; future metadata-bearing variants
+/// (e.g. a `Node::Title` for `<title>` if we ever surface it) would
+/// land here.
+fn is_metadata(node: &Node) -> bool {
+    matches!(node, Node::Style(_))
 }
 
 fn emit_node(node: &Node, out: &mut String) -> Result<(), Error> {
@@ -67,6 +82,9 @@ fn emit_node(node: &Node, out: &mut String) -> Result<(), Error> {
             emit_text_literal(t, out);
             Ok(())
         }
+        // Reachable only if a future caller forgets to filter; produce
+        // no output to keep the builder chain syntactically valid.
+        Node::Style(_) => Ok(()),
     }
 }
 
@@ -96,7 +114,7 @@ fn emit_element(el: &Element, out: &mut String) -> Result<(), Error> {
         }
     }
 
-    for child in &el.children {
+    for child in el.children.iter().filter(|c| !is_metadata(c)) {
         out.push_str(".child(");
         emit_node(child, out)?;
         out.push(')');
@@ -224,5 +242,80 @@ mod tests {
             out,
             r#"div().flex().flex_col().gap_2().p_4().bg(theme.surface).child(span().child("Hello, gpui!")).child(div().text_color(theme.muted).child("Compiled from HTML."))"#
         );
+    }
+
+    // ---------- issue #26: full HTML document codegen ---------------------
+
+    #[test]
+    fn compile_full_html_document_uses_body_root() {
+        // Boilerplate around a single body root must produce the same
+        // output as the bare element — wrappers and metadata are
+        // stripped, the body's UI subtree is the codegen root.
+        let full = r#"<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <title>Hello</title>
+  </head>
+  <body>
+    <div class="flex"><span>hi</span></div>
+  </body>
+</html>"#;
+        let bare = r#"<div class="flex"><span>hi</span></div>"#;
+        assert_eq!(compile(full).unwrap(), compile(bare).unwrap());
+    }
+
+    #[test]
+    fn compile_full_html_with_head_style_script_ignores_non_ui_nodes() {
+        // <style> survives parse (Node::Style) but is filtered from
+        // root counting and from element children. <script>, <meta>,
+        // <link>, <title> never produce nodes at all. Net effect: the
+        // body's div is the only root.
+        let src = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <link rel="preconnect" href="https://fonts.example/">
+    <title>x</title>
+    <style>.a { color: red; }</style>
+    <script>console.log("hi");</script>
+  </head>
+  <body>
+    <div></div>
+  </body>
+</html>"#;
+        assert_eq!(compile(src).unwrap(), "div()");
+    }
+
+    #[test]
+    fn compile_body_with_two_roots_still_errors() {
+        // Multi-root rule applies to the flattened post-wrapper node
+        // list, not just to bare-element input.
+        let err = compile("<html><body><div></div><div></div></body></html>").unwrap_err();
+        assert!(matches!(err, Error::Codegen(_)));
+    }
+
+    #[test]
+    fn compile_body_with_no_roots_errors() {
+        // An HTML document whose body contains only metadata / no UI
+        // elements produces the standard empty-document codegen error.
+        let err = compile("<html><body></body></html>").unwrap_err();
+        assert!(matches!(err, Error::Codegen(_)));
+    }
+
+    #[test]
+    fn compile_without_body_falls_back_to_first_document_ui_root() {
+        // No html/body wrappers — the existing single-root rule applies
+        // at document level. (This is the pre-#26 path; verify it
+        // still works.)
+        assert_eq!(compile("<div></div>").unwrap(), "div()");
+    }
+
+    #[test]
+    fn style_node_does_not_appear_as_child() {
+        // A `<style>` inside an element body shouldn't produce a
+        // `.child()` call — the metadata filter applies to children too.
+        let src = "<div><style>.foo { color: red; }</style><span>hi</span></div>";
+        assert_eq!(compile(src).unwrap(), r#"div().child(span().child("hi"))"#);
     }
 }
