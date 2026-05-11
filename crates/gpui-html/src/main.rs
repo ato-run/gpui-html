@@ -3,20 +3,29 @@
 //! Usage:
 //!
 //! ```text
-//! gpui-html compile <input> [-o <output>] [--format human|json]
-//! gpui-html check   <input>              [--format human|json]
+//! gpui-html compile <input> [-o <output>] [--manifest <path>] [--format human|json]
+//! gpui-html check   <input>              [--manifest <path>] [--format human|json]
 //! ```
 //!
 //! Exit codes:
 //!
 //! - `0` — success
-//! - `1` — gpuiHTML compilation error (parse / class / codegen)
-//! - `2` — CLI usage error (missing file, bad flags, IO failure)
+//! - `1` — gpuiHTML compilation error (parse / class / codegen / CSS)
+//! - `2` — CLI usage error (missing file, bad flags, IO failure,
+//!   manifest parse error)
 //!
 //! `--format json` emits one [`Diagnostic`](gpui_html_core::diagnostic::Diagnostic)
 //! per line on stderr (newline-delimited JSON) so editors and CI can
 //! parse it without a streaming JSON reader. The schema is stable across
 //! v0.1 patch releases — see docs/spec.md § Diagnostics.
+//!
+//! `--manifest <path>` loads a TOML host theme manifest. When supplied:
+//! - `bg-X` / `text-X` / `border-X` and CSS `var(--theme-X)` validate
+//!   `X` against the manifest's `[colors]` table.
+//! - Custom-scale sizing utilities (`max-w-<custom>`, etc.) resolve
+//!   via the manifest's sizing tables instead of rejecting.
+//!
+//! See `crates/gpui-html-core/src/manifest.rs` for the schema.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,6 +33,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gpui_html_core::diagnostic::Diagnostic;
+use gpui_html_core::ThemeManifest;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,6 +55,10 @@ enum Cmd {
         /// Output file. Writes to stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Optional host theme manifest (TOML). Tightens theme-token
+        /// validation and resolves custom-scale sizing utilities.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
         /// Diagnostic output format.
         #[arg(long, default_value_t = Format::Human)]
         format: Format,
@@ -54,6 +68,10 @@ enum Cmd {
     Check {
         /// Input gpuiHTML file.
         input: PathBuf,
+        /// Optional host theme manifest (TOML). Tightens theme-token
+        /// validation and resolves custom-scale sizing utilities.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
         /// Diagnostic output format.
         #[arg(long, default_value_t = Format::Human)]
         format: Format,
@@ -80,13 +98,23 @@ fn main() -> ExitCode {
         Cmd::Compile {
             input,
             output,
+            manifest,
             format,
-        } => run_compile(input, output, format),
-        Cmd::Check { input, format } => run_check(input, format),
+        } => run_compile(input, output, manifest, format),
+        Cmd::Check {
+            input,
+            manifest,
+            format,
+        } => run_check(input, manifest, format),
     }
 }
 
-fn run_compile(input: PathBuf, output: Option<PathBuf>, format: Format) -> ExitCode {
+fn run_compile(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+    format: Format,
+) -> ExitCode {
     let src = match std::fs::read_to_string(&input) {
         Ok(s) => s,
         Err(e) => {
@@ -95,7 +123,12 @@ fn run_compile(input: PathBuf, output: Option<PathBuf>, format: Format) -> ExitC
         }
     };
 
-    let rendered = match gpui_html_core::compile(&src) {
+    let manifest = match load_manifest(manifest.as_deref()) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+
+    let rendered = match gpui_html_core::compile_with_manifest(&src, manifest.as_ref()) {
         Ok(s) => s,
         Err(err) => {
             report_error(&err, &src, Some(&input), format);
@@ -118,7 +151,7 @@ fn run_compile(input: PathBuf, output: Option<PathBuf>, format: Format) -> ExitC
     ExitCode::SUCCESS
 }
 
-fn run_check(input: PathBuf, format: Format) -> ExitCode {
+fn run_check(input: PathBuf, manifest: Option<PathBuf>, format: Format) -> ExitCode {
     let src = match std::fs::read_to_string(&input) {
         Ok(s) => s,
         Err(e) => {
@@ -126,13 +159,39 @@ fn run_check(input: PathBuf, format: Format) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match gpui_html_core::compile(&src) {
+
+    let manifest = match load_manifest(manifest.as_deref()) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+
+    match gpui_html_core::compile_with_manifest(&src, manifest.as_ref()) {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
             report_error(&err, &src, Some(&input), format);
             ExitCode::from(1)
         }
     }
+}
+
+/// Load and parse an optional manifest file. Returns `Ok(None)` when
+/// no path was provided, `Ok(Some(_))` on a clean load, and `Err(code)`
+/// on IO / parse failure (with a human message already written to
+/// stderr). The returned exit code is always 2 — manifest problems
+/// are usage errors, not compilation errors.
+fn load_manifest(path: Option<&std::path::Path>) -> Result<Option<ThemeManifest>, ExitCode> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let src = std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("gpui-html: cannot read manifest {}: {e}", path.display());
+        ExitCode::from(2)
+    })?;
+    let manifest = ThemeManifest::from_toml(&src).map_err(|e| {
+        eprintln!("gpui-html: {} — {e}", path.display());
+        ExitCode::from(2)
+    })?;
+    Ok(Some(manifest))
 }
 
 fn report_error(err: &gpui_html_core::Error, src: &str, input: Option<&PathBuf>, format: Format) {

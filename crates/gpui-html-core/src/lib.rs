@@ -19,14 +19,38 @@ pub mod class_map;
 pub mod codegen;
 pub mod css;
 pub mod diagnostic;
+pub mod manifest;
 pub mod parse;
 
 pub use ast::Span;
+pub use manifest::ThemeManifest;
 
-/// Convenience: gpuiHTML source -> emitted gpui Rust source.
+/// Convenience: gpuiHTML source -> emitted gpui Rust source, using
+/// the compiler's built-in defaults (no manifest validation, single
+/// app-shell compatibility exemption for `max-w-128`).
 pub fn compile(src: &str) -> Result<String, Error> {
+    compile_with_manifest(src, None)
+}
+
+/// Compile a gpuiHTML source with an optional [`ThemeManifest`].
+///
+/// When a manifest is supplied the compiler tightens the contract:
+///
+/// - `bg-X` / `text-X` / `border-X` and CSS `var(--theme-X)`
+///   validate `X` against the manifest's `[colors]` table. Unknown
+///   names surface as `UnknownThemeToken` with a span.
+/// - Custom-scale sizing tokens (`max-w-<custom>` / `max-h-<custom>` /
+///   `min-w-<custom>` / `min-h-<custom>`) resolve via the manifest's
+///   `[max-width]` / `[max-height]` / `[min-width]` / `[min-height]`
+///   tables rather than rejecting with a "needs manifest" hint.
+///
+/// Without a manifest the existing back-compat behavior applies:
+/// theme tokens pass through symbolically (rustc validates them
+/// downstream), and only the single `max-w-128` compat exemption
+/// resolves.
+pub fn compile_with_manifest(src: &str, manifest: Option<&ThemeManifest>) -> Result<String, Error> {
     let nodes = parse::parse(src)?;
-    codegen::emit(&nodes)
+    codegen::emit_with_manifest(&nodes, manifest)
 }
 
 /// Structured compiler error. Every variant carries the source [`Span`] of

@@ -181,13 +181,15 @@ impl MethodCall {
 /// earlier ones for conflicting Style fields).
 ///
 /// Equivalent to [`lower_classes_with_styles`] called with an empty
-/// `StyleMap` — i.e. no `<style>` rules in the document, only utility
-/// classes.
+/// `StyleMap` and no manifest — i.e. no `<style>` rules in the
+/// document, no host theme manifest, only utility classes.
 pub fn lower_classes(classes: &[ClassToken]) -> Result<Vec<MethodCall>, Error> {
-    lower_classes_with_styles(classes, &StyleMap::new())
+    lower_classes_with_styles(classes, &StyleMap::new(), None)
 }
 
-/// Lower utility classes *and* `<style>` rule bindings in one pass.
+/// Lower utility classes *and* `<style>` rule bindings in one pass,
+/// optionally validating theme tokens / resolving custom-scale sizing
+/// against a host [`ThemeManifest`].
 ///
 /// **Order contract** (pinned by tests; see PR #27 for the rationale):
 ///
@@ -204,9 +206,22 @@ pub fn lower_classes(classes: &[ClassToken]) -> Result<Vec<MethodCall>, Error> {
 /// later `.gap_2()` override an earlier `.gap_4()` from a CSS rule.
 /// The user-facing rationale is that `class="..."` reads as a local
 /// override of any rule the class might also have in `<style>`.
+///
+/// When `manifest` is `Some`:
+/// - `bg-X` / `text-X` / `border-X` and CSS `var(--theme-X)` validate
+///   `X` against the manifest's `[colors]`. Unknown names surface as
+///   `UnknownThemeToken` with a span.
+/// - `max-w-<custom>` / `max-h-<custom>` / `min-w-<custom>` /
+///   `min-h-<custom>` not on the v0.1 spacing scale resolve via the
+///   manifest's corresponding sizing tables instead of rejecting.
+///
+/// When `manifest` is `None`, the v0.1 built-in defaults apply: theme
+/// tokens pass through symbolically, only the `max-w-128` single
+/// app-shell exemption resolves.
 pub fn lower_classes_with_styles(
     classes: &[ClassToken],
     style_map: &StyleMap,
+    manifest: Option<&crate::manifest::ThemeManifest>,
 ) -> Result<Vec<MethodCall>, Error> {
     let mut result: Vec<MethodCall> = Vec::new();
 
@@ -224,7 +239,7 @@ pub fn lower_classes_with_styles(
     // GPUI builder call — see #19) also pass silently: they appear in
     // source order but emit nothing.
     for cls in classes {
-        match lower_one(cls) {
+        match lower_one(cls, manifest) {
             Ok(Some(call)) => result.push(call),
             Ok(None) => {
                 // Recognized no-op (e.g. font-sans). Source position is
@@ -251,7 +266,17 @@ pub fn lower_classes_with_styles(
 /// equivalent. v0.1 uses this for `font-sans`, where font-family lives
 /// at the gpui app/Theme level rather than per-element. See #19 for
 /// the design discussion.
-fn lower_one(tok: &ClassToken) -> Result<Option<MethodCall>, Error> {
+///
+/// `manifest` enables host-side validation when present:
+/// - `bg-X` / `text-X` / `border-X` whose `X` isn't declared in
+///   `manifest.colors` surfaces as `UnknownThemeToken` with a span.
+/// - `max-w-<custom>` / `max-h-<custom>` / `min-w-<custom>` /
+///   `min-h-<custom>` not on the v0.1 spacing scale resolve via the
+///   manifest's sizing tables instead of rejecting.
+fn lower_one(
+    tok: &ClassToken,
+    manifest: Option<&crate::manifest::ThemeManifest>,
+) -> Result<Option<MethodCall>, Error> {
     let raw = tok.raw.as_str();
 
     // Recognized no-op classes: accepted for Tailwind preview compat
@@ -302,7 +327,7 @@ fn lower_one(tok: &ClassToken) -> Result<Option<MethodCall>, Error> {
         return Ok(Some(call));
     }
 
-    if let Some(call) = lower_sizing(raw) {
+    if let Some(call) = lower_sizing(raw, manifest) {
         return Ok(Some(call));
     }
 
@@ -323,7 +348,7 @@ fn lower_one(tok: &ClassToken) -> Result<Option<MethodCall>, Error> {
         return Ok(Some(call));
     }
 
-    if let Some(call) = lower_border(raw) {
+    if let Some(call) = lower_border(tok, manifest)? {
         return Ok(Some(call));
     }
 
@@ -402,6 +427,7 @@ fn lower_one(tok: &ClassToken) -> Result<Option<MethodCall>, Error> {
         }
 
         if let Some(normalized) = normalize_theme_token(rest) {
+            validate_theme_token(rest, tok.span, manifest)?;
             return Ok(Some(MethodCall::unary("bg", format!("theme.{normalized}"))));
         }
     }
@@ -410,8 +436,11 @@ fn lower_one(tok: &ClassToken) -> Result<Option<MethodCall>, Error> {
         // text-xs..text-3xl are typography sizes (handled by
         // `lower_typography` above). Anything else under `text-` is a
         // color theme token — possibly hyphenated, normalized to
-        // snake_case for the Rust field access.
+        // snake_case for the Rust field access. When a manifest is
+        // supplied, the original (hyphenated) token is validated
+        // against the host's `[colors]` table.
         if let Some(normalized) = normalize_theme_token(token) {
+            validate_theme_token(token, tok.span, manifest)?;
             return Ok(Some(MethodCall::unary(
                 "text_color",
                 format!("theme.{normalized}"),
@@ -534,16 +563,47 @@ fn is_negative_margin(raw: &str) -> bool {
 /// Out-of-spec numeric prefixes (`max-w-128`) and viewport keywords
 /// (`w-screen` / `h-screen`) are deliberately NOT handled here — see the
 /// module-level doc comment.
-fn lower_sizing(raw: &str) -> Option<MethodCall> {
+fn lower_sizing(
+    raw: &str,
+    manifest: Option<&crate::manifest::ThemeManifest>,
+) -> Option<MethodCall> {
     if let Some(call) = lower_sizing_keyword(raw) {
         return Some(call);
     }
 
-    // App-shell compatibility (#19): `max-w-128` is the only custom-scale
-    // sizing token v0.1 recognizes. The Ato Desktop preview's Tailwind
-    // config defines `128 = 32rem` and the fixture relies on it. Any
-    // other `max-w-<custom>` (e.g. `max-w-card`, `max-w-200`) falls
-    // through and gets the v0.2-manifest hint via `hint_for`.
+    // Manifest-provided custom scales for min/max width and height
+    // take priority. The manifest stores pre-formatted `rems(N.0)`
+    // strings so codegen can splice them verbatim.
+    if let Some(m) = manifest {
+        if let Some(suffix) = raw.strip_prefix("max-w-") {
+            if let Some(value) = m.lookup_max_width(suffix) {
+                return Some(MethodCall::unary("max_w", value.to_string()));
+            }
+        }
+        if let Some(suffix) = raw.strip_prefix("max-h-") {
+            if let Some(value) = m.lookup_max_height(suffix) {
+                return Some(MethodCall::unary("max_h", value.to_string()));
+            }
+        }
+        if let Some(suffix) = raw.strip_prefix("min-w-") {
+            if let Some(value) = m.lookup_min_width(suffix) {
+                return Some(MethodCall::unary("min_w", value.to_string()));
+            }
+        }
+        if let Some(suffix) = raw.strip_prefix("min-h-") {
+            if let Some(value) = m.lookup_min_height(suffix) {
+                return Some(MethodCall::unary("min_h", value.to_string()));
+            }
+        }
+    }
+
+    // App-shell compatibility (#19): when no manifest declares a
+    // `max-w-128` entry, the built-in single-token exemption still
+    // resolves it. The Ato Desktop preview's Tailwind config defines
+    // `128 = 32rem` and the fixture relies on this without needing a
+    // manifest at all. Once a manifest is supplied, the manifest
+    // takes precedence (handled above) — including overriding the
+    // built-in 32rem if the host wants a different value.
     if raw == "max-w-128" {
         return Some(MethodCall::unary("max_w", "rems(32.0)".into()));
     }
@@ -732,17 +792,23 @@ fn typography_rejection_hint(raw: &str) -> Option<String> {
 /// (c) refusing it would make the diagnostic misleading
 /// (`border-b` would lower as `border_color(theme.b)`, which is even
 /// worse than UnknownClass). PR description calls this out for review.
-fn lower_border(raw: &str) -> Option<MethodCall> {
+fn lower_border(
+    tok: &ClassToken,
+    manifest: Option<&crate::manifest::ThemeManifest>,
+) -> Result<Option<MethodCall>, Error> {
+    let raw = tok.raw.as_str();
     // Bare keyword and style keyword cases short-circuit before any
     // prefix manipulation.
     if raw == "border" {
-        return Some(MethodCall::nullary("border_1"));
+        return Ok(Some(MethodCall::nullary("border_1")));
     }
     if raw == "border-dashed" {
-        return Some(MethodCall::nullary("border_dashed"));
+        return Ok(Some(MethodCall::nullary("border_dashed")));
     }
 
-    let rest = raw.strip_prefix("border-")?;
+    let Some(rest) = raw.strip_prefix("border-") else {
+        return Ok(None);
+    };
 
     // Directional cases: bare side (`t` / `r` / `b` / `l`) and side+N
     // (`t-2`, `b-3`, ...). These must come before the plain numeric and
@@ -750,31 +816,54 @@ fn lower_border(raw: &str) -> Option<MethodCall> {
     // color named `b`.
     for side in ["t", "r", "b", "l"] {
         if rest == side {
-            return Some(MethodCall::nullary(&format!("border_{side}_1")));
+            return Ok(Some(MethodCall::nullary(&format!("border_{side}_1"))));
         }
         if let Some(num_str) = rest.strip_prefix(&format!("{side}-")) {
-            return parse_spacing_step(num_str)
-                .map(|n| MethodCall::nullary(&format!("border_{side}_{n}")));
+            return Ok(parse_spacing_step(num_str)
+                .map(|n| MethodCall::nullary(&format!("border_{side}_{n}"))));
         }
     }
 
     // Plain numeric width: `border-N`.
     if let Some(n) = parse_spacing_step(rest) {
-        return Some(MethodCall::nullary(&format!("border_{n}")));
+        return Ok(Some(MethodCall::nullary(&format!("border_{n}"))));
     }
 
     // Theme color: `border-<token>`. Hyphenated multi-word tokens
     // (`border-accent-foreground`) normalize to snake_case for the
     // Rust field name. Palette shapes (`border-red-500`) reject via
-    // `normalize_theme_token`'s numeric-segment guard.
+    // `normalize_theme_token`'s numeric-segment guard. When a
+    // manifest is supplied, the original token (hyphenated form)
+    // is validated against the host's [colors] table.
     if let Some(normalized) = normalize_theme_token(rest) {
-        return Some(MethodCall::unary(
+        validate_theme_token(rest, tok.span, manifest)?;
+        return Ok(Some(MethodCall::unary(
             "border_color",
             format!("theme.{normalized}"),
-        ));
+        )));
     }
 
-    None
+    Ok(None)
+}
+
+/// When a manifest is provided, ensure the token name appears in the
+/// host's `[colors]` table. The manifest stores token names in their
+/// **original** (hyphenated, pre-normalization) form, so this check
+/// uses the hyphenated source string, not the snake_case Rust ident.
+fn validate_theme_token(
+    name: &str,
+    span: crate::ast::Span,
+    manifest: Option<&crate::manifest::ThemeManifest>,
+) -> Result<(), Error> {
+    if let Some(m) = manifest {
+        if !m.knows_color(name) {
+            return Err(Error::UnknownThemeToken {
+                token: name.to_string(),
+                span,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Lower a Tailwind overflow utility to its gpui builder method.
