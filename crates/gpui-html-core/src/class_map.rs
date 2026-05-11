@@ -104,9 +104,14 @@
 //!   bg-<token>      -> .bg(theme.<token>)
 //!   text-<token>    -> .text_color(theme.<token>)
 //!
-//!   Theme-token alpha (`bg-<token>/<n>`) is **deferred** — see #23 for
-//!   the design discussion. Rejected with a hint that points at the
-//!   issue, not silently treated as a normal theme token.
+//!   Theme-token alpha (`bg-<token>/<n>`, n ∈ 0..=100) lowers to a
+//!   literal `gpui::rgba(0xRRGGBBAA)` ONLY when a manifest declares the
+//!   token's color. The manifest's RGB becomes the upper three bytes
+//!   and the slash alpha becomes the A byte (overriding any alpha the
+//!   manifest's `#rrggbbaa` may have declared). Without a manifest the
+//!   compiler can't know the token's color and rejects with a hint
+//!   pointing at `--manifest`. Palette + alpha (`bg-red-500/80`)
+//!   continues to reject even with a manifest — see #23.
 //!
 //! Radius:
 //!   rounded                -> .rounded_md()             (bare = md)
@@ -400,29 +405,66 @@ fn lower_one(
             )));
         }
 
-        // Theme-token alpha (`bg-<token>/<n>`) is deferred — see #23.
-        // Detect the shape and reject with an actionable hint instead
-        // of falling through to the generic UnknownClass path. Palette
-        // utilities with alpha (`bg-red-500/80`) don't match this branch
-        // (the token shape rejects palette via `normalize_theme_token`)
-        // and keep their existing palette rejection through `hint_for`.
+        // Theme-token alpha (`bg-<token>/<n>`) — #23. The compiler can
+        // only lower this when a manifest supplies the color value, so
+        // the RGB bytes come from the manifest and the slash alpha
+        // becomes the A channel of a packed `gpui::rgba(0xRRGGBBAA)`
+        // literal. Without a manifest, the compiler doesn't know the
+        // theme's colors and rejects with a hint pointing at
+        // `--manifest`.
+        //
+        // Palette utilities with alpha (`bg-red-500/80`) don't match
+        // this branch — the palette token shape is hyphen-separated
+        // with a numeric trailing segment, which `normalize_theme_token`
+        // rejects — so they fall through to the existing palette
+        // rejection through `hint_for`.
         if let Some((token, alpha)) = rest.split_once('/') {
             if normalize_theme_token(token).is_some()
                 && !alpha.is_empty()
                 && alpha.chars().all(|c| c.is_ascii_digit())
             {
-                return Err(Error::UnknownClass {
-                    class: raw.to_string(),
-                    span: tok.span,
-                    hint: Some(
-                        "theme-token alpha (`bg-<token>/<n>`) is not lowered yet. \
-                         The compiler doesn't know your theme's color values, so it \
-                         can't packed-RGBA them at lowering time. Use `bg-<token>` \
-                         without alpha for now, or set the alpha in your theme struct \
-                         directly. Tracked in #23."
-                            .into(),
-                    ),
-                });
+                let alpha_n: u32 = alpha.parse().unwrap_or(u32::MAX);
+                if alpha_n > 100 {
+                    return Err(Error::UnknownClass {
+                        class: raw.to_string(),
+                        span: tok.span,
+                        hint: Some(
+                            "theme-token alpha must be in the range 0..=100 \
+                             (Tailwind's opacity scale)."
+                                .into(),
+                        ),
+                    });
+                }
+                let Some(m) = manifest else {
+                    return Err(Error::UnknownClass {
+                        class: raw.to_string(),
+                        span: tok.span,
+                        hint: Some(
+                            "theme-token alpha (`bg-<token>/<n>`) needs a theme \
+                             manifest so the compiler can read the token's RGB \
+                             value. Pass `--manifest <path>` with a `[colors]` \
+                             table entry for the token, or drop the `/<n>` \
+                             suffix and use `bg-<token>` (the host theme owns \
+                             the color at runtime)."
+                                .into(),
+                        ),
+                    });
+                };
+                let Some(rgba) = m.lookup_color_rgba(token) else {
+                    return Err(Error::UnknownThemeToken {
+                        token: token.to_string(),
+                        span: tok.span,
+                    });
+                };
+                // Slash alpha overrides whatever alpha the manifest's
+                // `#rrggbbaa` declared — `bg-accent/50` means 50% alpha
+                // regardless of accent's manifest alpha byte.
+                let alpha_byte = ((alpha_n * 255 + 50) / 100) as u8;
+                let packed = u32::from_be_bytes([rgba[0], rgba[1], rgba[2], alpha_byte]);
+                return Ok(Some(MethodCall::unary(
+                    "bg",
+                    format!("gpui::rgba(0x{packed:08x})"),
+                )));
             }
         }
 
@@ -2066,12 +2108,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_bg_token_alpha_with_hint_for_issue_23() {
-        // `bg-<theme-token>/<n>` is the Tailwind opacity-suffix shape.
-        // PR #15 deliberately defers this (see #23 for design discussion):
-        // the compiler doesn't know theme color values, so it can't packed-
-        // RGBA them. Must reject with a hint pointing at #23, not silently
-        // fall through to UnknownClass.
+    fn reject_bg_token_alpha_without_manifest_points_at_manifest_flag() {
+        // `bg-<theme-token>/<n>` only lowers when a manifest declares
+        // the token's color. Without one, the compiler has no RGB bytes
+        // to combine with the slash alpha, so it rejects with a hint
+        // pointing at `--manifest`. This is the v0.1 behavior — keep
+        // the contract pinned so a future regression doesn't silently
+        // fall through to UnknownClass with the generic palette hint.
         for raw in ["bg-accent/10", "bg-rose/80", "bg-surface/50"] {
             let err = lower_classes(&[tok(raw)]).unwrap_err();
             match err {
@@ -2079,8 +2122,8 @@ mod tests {
                     assert_eq!(class, raw);
                     let hint = hint.unwrap_or_default();
                     assert!(
-                        hint.contains("#23"),
-                        "opacity-suffix hint should reference #23, got: {hint}"
+                        hint.contains("--manifest"),
+                        "no-manifest hint should mention --manifest, got: {hint}"
                     );
                 }
                 other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
@@ -2395,17 +2438,18 @@ mod tests {
     }
 
     #[test]
-    fn slash_alpha_routes_to_issue_23_for_theme_tokens() {
-        // `bg-accent-foreground/10` is theme-token alpha (deferred to
-        // #23). Must produce the #23 hint, not the palette hint —
-        // hyphenated theme tokens are theme tokens, not palette.
+    fn slash_alpha_for_hyphenated_theme_token_routes_to_manifest_hint() {
+        // `bg-accent-foreground/10` is theme-token alpha — hyphenated
+        // theme tokens are theme tokens, not palette. Without a
+        // manifest, must produce the manifest-pointer hint, not the
+        // palette hint.
         let err = lower_classes(&[tok("bg-accent-foreground/10")]).unwrap_err();
         match err {
             Error::UnknownClass { hint, .. } => {
                 let hint = hint.unwrap_or_default();
                 assert!(
-                    hint.contains("#23"),
-                    "expected #23-aware hint for hyphenated theme alpha, got: {hint}"
+                    hint.contains("--manifest"),
+                    "expected manifest-aware hint for hyphenated theme alpha, got: {hint}"
                 );
             }
             other => panic!("expected UnknownClass, got {other:?}"),
