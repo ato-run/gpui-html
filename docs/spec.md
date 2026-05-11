@@ -386,6 +386,56 @@ ident `theme.accent_foreground` を生成する。
 `Styled::bg`, `text_color`, `border_color` は `impl Into<Hsla>` を取る。
 theme tokens は `Hsla` 定数として解決される。([trait.Styled][styled])
 
+#### Theme-token alpha (`bg-<token>/<n>`)
+
+`bg-<token>/<alpha>` (`<alpha>` ∈ 0..=100、Tailwind opacity scale) は
+**manifest が color 値を保持しているときに限り** packed RGBA literal
+に lowering される (issue #23)。manifest の `[colors]` entry が
+RGB 三色を提供し、slash の `<alpha>` byte が A channel として上書きする:
+
+```text
+[colors]
+accent = "#6366f1"          ← manifest が RGB を宣言
+
+bg-accent/50                → .bg(gpui::rgba(0x6366f180))
+bg-accent/10                → .bg(gpui::rgba(0x6366f11a))
+```
+
+設計判断:
+
+- **manifest が無い場合は reject**。コンパイラは theme の色値を知らない
+  ので、RGB を捏造できない。hint で `--manifest` を案内する。
+- **host の `Theme` API には依存しない**。`.opacity()` のような per-host
+  method を assume すると `gpui-html-core` が host (Ato Desktop) に
+  漏れる。代わりに静的 packed RGBA literal だけを emit する。
+- **slash alpha は manifest の `#rrggbbaa` の alpha byte に優先する**。
+  `accent = "#11223380"` で `bg-accent/50` を書くと、最終 byte は `0x80`
+  (manifest 由来ではなく 50% 換算) になる。manifest の alpha は plain
+  `bg-<token>` 経路の `theme.<token>` ランタイム参照時に意味を持つ。
+- **palette + alpha (`bg-red-500/80`) は reject のまま**。palette
+  utility は manifest が有ろうと無かろうと禁止 (上の disambiguation
+  ルール参照)。`hint_for` が palette message を出す。
+- **rounding は `(alpha * 255 + 50) / 100`**。CSS `rgba(_, _, _, 0.5)`
+  と同じ慣習: 50% → 0x80 (127.5 を round-half-up)。
+
+未対応 (v0.1 の意図的 scope-cut):
+
+- `text-<token>/<alpha>` / `border-<token>/<alpha>` は v0.2+。今は
+  `bg-` のみ。
+- `<alpha>` の任意小数 (Tailwind 6 の `/52` のような不在の段) は
+  許可するが、文字列としては `0..=100` の整数だけ受け付ける。
+
+manifest の `[colors]` 値 syntax (issue #23 で値も load-bearing になった):
+
+```text
+"#rgb"      ← short form. 各 nibble doubled (#abc → #aabbcc)
+"#rrggbb"   ← alpha は 0xff 既定
+"#rrggbbaa" ← alpha 込み (slash alpha があれば上書き)
+```
+
+case-insensitive。`#rgba` short-form (alpha 込み 4 桁) や CSS 名前色
+(`red`)、`rgb()`/`hsl()` 関数は v0.1 では reject する。
+
 ### Typography
 
 許可。
@@ -742,10 +792,12 @@ accent  = "#6366f1"
   `.max_w(rems(N))` 形式に解決する。値は `<n>rem` または `<n>px` の
   みを受け取る (`16px = 1rem`)。それ以外 (`%`, `vh`, `calc(...)`) は
   manifest load 時の hard fail。
-- `[colors]` の VALUE (hex / rgba 文字列) は v0.1 では検証しないし、
-  Rust 出力にも埋め込まない (host の `Theme` struct がそれぞれの
-  Rust 定義を保持する前提)。これは #23 (theme-token alpha) が
-  packed-RGBA lowering に拡張する余地のために残してある。
+- `[colors]` の VALUE は `#rgb` / `#rrggbb` / `#rrggbbaa` のいずれかの
+  hex literal でなければならない (#23)。plain `bg-<token>` の lowering は
+  依然 `theme.<token>` の symbolic 参照を emit するので host の `Theme`
+  struct の色値が runtime で勝つ。**slash-alpha 形式 (`bg-<token>/<n>`)
+  だけが** manifest の RGB を読み取って packed RGBA literal に展開する
+  (上の "Theme-token alpha" 節参照)。
 - 不明な section (`[shadow]`, `[font]` など) は forward-compat の
   ために silently 無視される。
 
@@ -757,18 +809,13 @@ manifest 無しの場合 (back-compat):
   される。それ以外の custom-scale token は `UnknownClass` + v0.2-
   manifest hint。
 
-color value を用いた lowering (例: `bg-accent/10` → packed RGBA) は
-v0.1 でも未実装で、#23 に残っている。manifest が色値を保持する
-インフラ自体は既にあるので、#23 を完了するための spec 拡張は最小
-で済む。
-
 ### v0.2 で予定する拡張
 
 ```text
 - dark / light variant の切替を spec で記述する。
 - spacing / radius / shadow を含む token 化を検討する。
-- color VALUE を読み込んで packed-RGBA / alpha lowering を可能にする
-  (#23)。
+- text-<token>/<alpha> / border-<token>/<alpha> の lowering
+  (#23 は bg- のみ)。
 - font-family / font stack manifest entry の検討。
 ```
 

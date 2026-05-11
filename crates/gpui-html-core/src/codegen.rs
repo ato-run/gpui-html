@@ -753,4 +753,149 @@ mod tests {
         let err = compile_with(r#"<div class="border-unknown"></div>"#, &m).unwrap_err();
         assert!(matches!(err, Error::UnknownThemeToken { .. }));
     }
+
+    // ---------- #23: theme-token alpha lowering ---------------------------
+
+    #[test]
+    fn manifest_bg_token_alpha_lowers_to_packed_rgba() {
+        // #23: `bg-accent/50` reads RGB from the manifest's [colors]
+        // (`accent = "#6366f1"`) and stitches the slash alpha (50%) on
+        // as the A byte. Rounding follows the CSS convention
+        // (`(n * 255 + 50) / 100`), so 50% → 128 = 0x80, matching
+        // `rgba(_, _, _, 0.5)`.
+        let m = small_manifest();
+        let out = compile_with(r#"<div class="bg-accent/50"></div>"#, &m).unwrap();
+        assert_eq!(out, "div().bg(gpui::rgba(0x6366f180))");
+    }
+
+    #[test]
+    fn manifest_bg_token_alpha_endpoint_values() {
+        // Boundary values: /0 → fully transparent, /100 → fully opaque.
+        // /10 is the common Tailwind low-opacity value; pin its rounding
+        // (10 * 255 + 50) / 100 = 26 = 0x1a so the spec-rendered
+        // canonical example is stable.
+        let m = small_manifest();
+        let cases = [
+            ("bg-accent/0", "div().bg(gpui::rgba(0x6366f100))"),
+            ("bg-accent/10", "div().bg(gpui::rgba(0x6366f11a))"),
+            ("bg-accent/100", "div().bg(gpui::rgba(0x6366f1ff))"),
+        ];
+        for (cls, expected) in cases {
+            let html = format!(r#"<div class="{cls}"></div>"#);
+            let out = compile_with(&html, &m).unwrap();
+            assert_eq!(out, expected, "case `{cls}`");
+        }
+    }
+
+    #[test]
+    fn manifest_bg_hyphenated_token_alpha_lowers() {
+        // Hyphenated theme tokens (`accent-foreground`) must work the
+        // same way — the manifest key is hyphenated, but the lowering
+        // emits a packed RGBA literal (no `theme.` field access),
+        // so the snake_case normalization doesn't matter here.
+        let m = small_manifest();
+        // accent-foreground = #ffffff → 100% opacity literal alpha
+        // suffix /25 → (25*255+50)/100 = 6425/100 = 64 = 0x40
+        let out = compile_with(r#"<div class="bg-accent-foreground/25"></div>"#, &m).unwrap();
+        assert_eq!(out, "div().bg(gpui::rgba(0xffffff40))");
+    }
+
+    #[test]
+    fn manifest_bg_token_alpha_slash_overrides_manifest_alpha() {
+        // If the manifest declared `#rrggbbaa` (with alpha), the slash
+        // alpha wins. The manifest's A byte is for plain `bg-<token>`
+        // semantics (which we still don't emit as a literal — only
+        // `theme.<name>` reads it at runtime); the slash alpha is what
+        // the author wrote here and now.
+        let m = crate::ThemeManifest::from_toml(
+            r##"
+            [colors]
+            translucent = "#11223380"
+            "##,
+        )
+        .unwrap();
+        // /50 overrides the manifest's 0x80 → 50% = 0x80 (rounding
+        // happens to land on the same byte here; the point of this
+        // test is the override, not the rounding).
+        let out = compile_with(r#"<div class="bg-translucent/50"></div>"#, &m).unwrap();
+        assert_eq!(out, "div().bg(gpui::rgba(0x11223380))");
+        // /25 overrides the manifest's 0x80 → 25% = 0x40, proving
+        // the override is real (not just coincidentally the same).
+        let out = compile_with(r#"<div class="bg-translucent/25"></div>"#, &m).unwrap();
+        assert_eq!(out, "div().bg(gpui::rgba(0x11223340))");
+    }
+
+    #[test]
+    fn manifest_bg_unknown_token_alpha_rejects_with_unknown_theme_token() {
+        // `bg-mystery/30` with a manifest in scope is an unknown theme
+        // token — same diagnostic as plain `bg-mystery` would emit.
+        // Don't silently fall through to UnknownClass.
+        let m = small_manifest();
+        let err = compile_with(r#"<div class="bg-mystery/30"></div>"#, &m).unwrap_err();
+        match err {
+            Error::UnknownThemeToken { token, .. } => assert_eq!(token, "mystery"),
+            other => panic!("expected UnknownThemeToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_bg_palette_alpha_still_rejects() {
+        // `bg-red-500/80` is palette + alpha. The user-emphasised
+        // contract is: even with a manifest, palette tokens don't
+        // lower (the compiler doesn't know Tailwind palette colors).
+        // Keep the palette hint, not a packed-RGBA emission.
+        let m = small_manifest();
+        let err = compile_with(r#"<div class="bg-red-500/80"></div>"#, &m).unwrap_err();
+        match err {
+            Error::UnknownClass { hint, .. } => {
+                let hint = hint.unwrap_or_default();
+                assert!(
+                    hint.contains("palette"),
+                    "palette+alpha must keep palette hint, got: {hint}"
+                );
+            }
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_bg_token_alpha_out_of_range_rejects() {
+        // Alpha 0..=100 only. `/101`, `/200` etc. fall outside the
+        // Tailwind opacity scale and reject with a range hint, not a
+        // surprising wrap-around.
+        let m = small_manifest();
+        for raw in ["bg-accent/101", "bg-accent/200", "bg-accent/255"] {
+            let html = format!(r#"<div class="{raw}"></div>"#);
+            let err = compile_with(&html, &m).unwrap_err();
+            match err {
+                Error::UnknownClass { class, hint, .. } => {
+                    assert_eq!(class, raw);
+                    let hint = hint.unwrap_or_default();
+                    assert!(
+                        hint.contains("0..=100"),
+                        "out-of-range hint should mention 0..=100, got: {hint}"
+                    );
+                }
+                other => panic!("expected UnknownClass for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_manifest_bg_token_alpha_still_rejects_with_manifest_hint() {
+        // Backstop: without a manifest, `bg-accent/50` rejects with the
+        // hint pointing at `--manifest`, not a packed-RGBA literal —
+        // the compiler can't invent RGB bytes from thin air.
+        let err = compile(r#"<div class="bg-accent/50"></div>"#).unwrap_err();
+        match err {
+            Error::UnknownClass { hint, .. } => {
+                let hint = hint.unwrap_or_default();
+                assert!(
+                    hint.contains("--manifest"),
+                    "no-manifest path must point at --manifest, got: {hint}"
+                );
+            }
+            other => panic!("expected UnknownClass, got {other:?}"),
+        }
+    }
 }
