@@ -129,8 +129,23 @@ fn emit_node(node: &Node, style_map: &StyleMap, out: &mut String) -> Result<(), 
 }
 
 fn emit_element(el: &Element, style_map: &StyleMap, out: &mut String) -> Result<(), Error> {
-    out.push_str(&el.tag);
+    // Map the source tag to its gpui constructor + tag-specific
+    // default method calls. `div`/`span` keep their literal name; the
+    // semantic tags (`p`, `h1..h3`, `button`) all use `div()` because
+    // gpui doesn't expose dedicated constructors for those — the
+    // browser-shaped semantics are encoded purely as default styling.
+    let (constructor, defaults) = tag_constructor_and_defaults(&el.tag);
+    out.push_str(constructor);
     out.push_str("()");
+
+    // Tag defaults come BEFORE the user's class chain so the user's
+    // `class="..."` (or matching `<style>` rule) wins via gpui
+    // builder semantics — later calls override earlier ones. Authors
+    // can therefore tweak heading defaults with the usual utility
+    // shorthand, e.g. `<h1 class="text-sm font-normal">`.
+    for m in defaults {
+        emit_method_call(&m, out);
+    }
 
     let methods = lower_classes_with_styles(&el.classes, style_map)?;
     for m in &methods {
@@ -161,6 +176,61 @@ fn emit_element(el: &Element, style_map: &StyleMap, out: &mut String) -> Result<
     }
 
     Ok(())
+}
+
+/// Map an HTML UI tag to its gpui constructor name + the canonical
+/// default `MethodCall`s the codegen emits before the user's class
+/// chain.
+///
+/// Reflects the v0.1 spec's tag table (`docs/spec.md` § 対応タグ):
+///
+/// - `<div>` / `<span>` keep their literal names (gpui's `div()` and
+///   `span()`).
+/// - `<p>` / `<button>` lower to `div()` with no inherent default —
+///   the spec lists "paragraph default text style" / "clickable
+///   element" but treating them as plain divs lets `class=` carry
+///   any styling the author wants without baking opinions in.
+/// - `<h1>` / `<h2>` / `<h3>` lower to `div()` with the explicit
+///   defaults the spec specifies (text size + font weight). Users
+///   override via `class=`.
+///
+/// The remaining spec-listed tags (`img`, `icon`, `slot`) are still
+/// rejected at parse time — they need asset / component-registry /
+/// runtime support that's not part of the v0.1 lowering surface.
+fn tag_constructor_and_defaults(tag: &str) -> (&'static str, Vec<MethodCall>) {
+    match tag {
+        "div" => ("div", Vec::new()),
+        "span" => ("span", Vec::new()),
+        "p" => ("div", Vec::new()),
+        "button" => ("div", Vec::new()),
+        "h1" => (
+            "div",
+            vec![
+                MethodCall::nullary("text_2xl"),
+                MethodCall::unary("font_weight", "FontWeight::BOLD".into()),
+            ],
+        ),
+        "h2" => (
+            "div",
+            vec![
+                MethodCall::nullary("text_xl"),
+                MethodCall::unary("font_weight", "FontWeight::SEMIBOLD".into()),
+            ],
+        ),
+        "h3" => (
+            "div",
+            vec![
+                MethodCall::nullary("text_lg"),
+                MethodCall::unary("font_weight", "FontWeight::SEMIBOLD".into()),
+            ],
+        ),
+        // Parser's SUPPORTED_TAGS keeps this exhaustive; anything else
+        // never reaches the codegen stage.
+        other => unreachable!(
+            "codegen reached unknown UI tag `{other}` — parser SUPPORTED_TAGS and \
+             codegen tag_constructor_and_defaults are out of sync"
+        ),
+    }
 }
 
 fn emit_method_call(m: &MethodCall, out: &mut String) {
@@ -461,5 +531,103 @@ mod tests {
 </div>"#;
         let out = compile(src).unwrap();
         assert_eq!(out, r#"div().flex().child(span().child("hi"))"#);
+    }
+
+    // ---------- broader UI tags --------------------------------------------
+
+    #[test]
+    fn p_lowers_to_plain_div() {
+        // `<p>` has no inherent heading-style defaults — Tailwind's
+        // `<p>` resets typography but doesn't add specific sizes.
+        // Class attribute carries any styling.
+        let out = compile("<p>hello</p>").unwrap();
+        assert_eq!(out, r#"div().child("hello")"#);
+    }
+
+    #[test]
+    fn button_lowers_to_plain_div() {
+        // Interactivity (`on:click`) is a separate feature track;
+        // for v0.1 a `<button>` is a `div()` styled via classes.
+        let out = compile(r#"<button class="bg-accent">Go</button>"#).unwrap();
+        assert_eq!(out, r#"div().bg(theme.accent).child("Go")"#);
+    }
+
+    #[test]
+    fn h1_emits_heading_defaults_before_class_chain() {
+        // Per spec: <h1> → div() + text_2xl + font_weight BOLD.
+        // Defaults precede the class chain so user classes can
+        // override.
+        let out = compile("<h1>Title</h1>").unwrap();
+        assert_eq!(
+            out,
+            r#"div().text_2xl().font_weight(FontWeight::BOLD).child("Title")"#
+        );
+    }
+
+    #[test]
+    fn h2_emits_heading_defaults() {
+        let out = compile("<h2>Sub</h2>").unwrap();
+        assert_eq!(
+            out,
+            r#"div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Sub")"#
+        );
+    }
+
+    #[test]
+    fn h3_emits_heading_defaults() {
+        let out = compile("<h3>Three</h3>").unwrap();
+        assert_eq!(
+            out,
+            r#"div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Three")"#
+        );
+    }
+
+    #[test]
+    fn user_class_overrides_heading_defaults_via_builder_order() {
+        // h1 defaults: text_2xl, font_weight(BOLD).
+        // User class:  text-sm, font-normal.
+        // Output: defaults first, then user — later calls override
+        // earlier (gpui builder semantics). The user gets text-sm /
+        // font-normal as the effective Style fields.
+        let out = compile(r#"<h1 class="text-sm font-normal">x</h1>"#).unwrap();
+        assert_eq!(
+            out,
+            r#"div().text_2xl().font_weight(FontWeight::BOLD).text_sm().font_weight(FontWeight::NORMAL).child("x")"#
+        );
+    }
+
+    #[test]
+    fn span_still_emits_span_constructor() {
+        // Regression: only div/span keep their literal constructors.
+        // span() must still be span(), not div() — the spec calls out
+        // that v0.2 may add an inline-flex shim but for v0.1 gpui has
+        // span() and we use it directly.
+        let out = compile("<span>hi</span>").unwrap();
+        assert_eq!(out, r#"span().child("hi")"#);
+    }
+
+    #[test]
+    fn deferred_spec_tags_still_unknown_tag() {
+        // <img>, <icon>, <slot> are in the spec table but explicitly
+        // deferred — they need asset / component / runtime support.
+        // Make sure they don't accidentally slip through.
+        for raw in ["<img/>", "<icon/>", "<slot/>"] {
+            let err = compile(raw).unwrap_err();
+            assert!(
+                matches!(err, Error::UnknownTag { .. }),
+                "expected UnknownTag for {raw:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_with_id_attr_preserves_attr() {
+        // The `id="..."` attribute path is shared with div/span and
+        // must still work for the semantic tags.
+        let out = compile(r#"<h2 id="exec-plan">Execution Plan</h2>"#).unwrap();
+        assert_eq!(
+            out,
+            r#"div().text_xl().font_weight(FontWeight::SEMIBOLD).id("exec-plan").child("Execution Plan")"#
+        );
     }
 }
